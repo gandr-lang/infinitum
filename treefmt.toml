@@ -28,14 +28,17 @@ excludes = [
   "docs/agents/baseline.md",
 ]
 
-# Generate through git-cliff, normalize its candidate with the Markdown
-# formatter, install changed bytes in place, then verify the root file.
-# Excluding CHANGELOG.md from commit path analysis also prevents a
-# changelog-only refresh from becoming its own release note.
+# Generate through the `changelog` task, normalize its candidate with the
+# Markdown formatter, install changed bytes in place, then verify the root
+# file. The task renders the history the default branch will hold — on a
+# branch that means the branch's own commits replaced by the squash subject —
+# so what a pull request carries is what the merge produces. Excluding
+# CHANGELOG.md from commit path analysis also prevents a changelog-only
+# refresh from becoming its own release note.
 [formatter."changelog-generate"]
 priority = -3
-command = "git-cliff"
-options = ["--output", ".git-cliff-output", "--exclude-path"]
+command = "mise"
+options = ["run", "changelog", "--exclude-path"]
 includes = ["CHANGELOG.md"]
 no-positional-arg-support = true
 

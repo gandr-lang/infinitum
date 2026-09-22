@@ -44,6 +44,9 @@ topo_order = false
 topo_order_commits = true
 sort_commits = "oldest"
 recurse_submodules = false
+# No subject rewriting: on a branch the generator is handed one synthetic
+# commit already carrying the squash subject, suffix included, so branch and
+# default branch render the same text without editing what Git recorded.
 commit_preprocessors = []
 commit_parsers = [
   { message = "^feat", group = "<!-- 00 -->Features" },

@@ -4,23 +4,17 @@ All notable changes to infinitum are documented here.
 
 ## Unreleased
 
-### Unreleased Features
+### Unreleased Bug Fixes
 
-- _(engine)_ Add the infinitum driver crate
+- _(repo)_ Generate the changelog as the squash will land it (#2)
 
-### Unreleased Documentation
+## 0.0.0 - 2026-09-22
 
-- _(agents)_ Adopt the shared guidance and bind it to this tree
+### 0.0.0 Features
 
-### Unreleased Continuous Integration
+- _(repo)_ Scaffold the repository and the placeholder driver (#1)
 
-- _(github)_ Open hosted CI in the shared shape
-
-### Unreleased Configuration
-
-- _(repo)_ Adopt the shared project configuration
-
-### Unreleased Maintenance
+### 0.0.0 Maintenance
 
 - _(repo)_ Add .gitignore
 
