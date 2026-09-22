@@ -1,0 +1,227 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# A bare `cargo build` builds the driver binary; whole-workspace work says
+# `--workspace --all-targets`.
+default-members = ["crates/cli"]
+
+[workspace.package]
+edition = "2024"
+# The floor the published packages support, and the highest `rust-version`
+# among the dependencies they resolve: `quenchant` requires 1.97, `clap`
+# requires 1.85. The pinned nightly is the development compiler and says
+# nothing about this floor; `cargo +1.97.1 check --locked --workspace` is what
+# holds it honest.
+rust-version = "1.97"
+repository = "https://github.com/gandr-lang/infinitum"
+license = "Apache-2.0 WITH LLVM-exception"
+
+# Command-line argument parser; the driver takes the `derive` face.
+# The feature list is the working minimum for a derive-built CLI: `std` for the
+# hosted build, `derive` for the `Parser` macro, and `help`/`usage`/
+# `error-context` for the generated `--help` text and the diagnostics an
+# argument error prints. The two remaining default features are cosmetic and
+# stay off until something needs them: `color` pulls the `anstream` terminal
+# stack, and `suggestions` pulls edit-distance matching that has nothing to
+# match against until the driver grows subcommands.
+# consumers:
+# - infinitum
+[workspace.dependencies.clap]
+version = "4.6.6"
+default-features = false
+features = ["derive", "error-context", "help", "std", "usage"]
+
+# The specification attribute: `#[quenchant::spec(...)]` states an obligation
+# beside the code it constrains. The release is a pre-release, so the
+# requirement names it exactly; a caret requirement would not match it at all.
+# The facade is the published namespace, and the expansion writes
+# `::quenchant::` helper paths, so the dependency keeps that name.
+# consumers:
+# - infinitum
+[workspace.dependencies.quenchant]
+version = "=0.0.0-rc.0"
+
+[workspace.lints.clippy]
+# all = { correctness, suspicious, style, complexity, perf }
+all = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+
+# nursery
+missing_const_for_fn = "allow"
+useless_let_if_seq = "allow"
+
+# pedantic
+similar_names = "allow"
+too_many_lines = "allow"
+uninlined_format_args = "allow"
+
+# style
+needless_raw_string_hashes = "allow"
+needless_return = "allow"
+
+# restriction
+alloc_instead_of_core = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+as_pointer_underscore = "deny"
+# Wire fields use explicit little-endian conversions, keeping bytes identical
+# across host and target byte orders. Host-local byte views for checksums or
+# caches use the same conversions instead of `to_ne_bytes` / `from_ne_bytes`;
+# this can require a byte swap on a big-endian host.
+# Reversal: a required external byte contract specifies big-endian or native
+# byte order; revisit `big_endian_bytes` or `host_endian_bytes` respectively.
+big_endian_bytes = "deny"
+cfg_not_test = "deny"
+clone_on_ref_ptr = "deny"
+create_dir = "deny"
+dbg_macro = "deny"
+decimal_literal_representation = "deny"
+default_numeric_fallback = "deny"
+default_union_representation = "deny"
+deref_by_slicing = "deny"
+disallowed_script_idents = "deny"
+doc_include_without_cfg = "deny"
+doc_paragraphs_missing_punctuation = "deny"
+empty_drop = "deny"
+empty_enum_variants_with_brackets = "deny"
+empty_structs_with_brackets = "deny"
+error_impl_error = "deny"
+exhaustive_enums = "allow"
+exhaustive_structs = "allow"
+exit = "deny"
+expect_used = "deny"
+field_scoped_visibility_modifiers = "deny"
+filetype_is_file = "deny"
+float_cmp_const = "deny"
+fn_to_numeric_cast_any = "deny"
+get_unwrap = "deny"
+host_endian_bytes = "deny"
+if_then_some_else_none = "deny"
+impl_trait_in_params = "deny"
+indexing_slicing = "deny"
+infinite_loop = "deny"
+inline_trait_bounds = "deny"
+integer_division = "deny"
+iter_over_hash_type = "deny"
+large_include_file = "deny"
+let_underscore_must_use = "deny"
+lossy_float_literal = "deny"
+map_err_ignore = "deny"
+map_with_unused_argument_over_ranges = "deny"
+mem_forget = "deny"
+missing_assert_message = "deny"
+missing_asserts_for_indexing = "deny"
+missing_docs_in_private_items = "deny"
+missing_inline_in_public_items = "deny"
+mixed_read_write_in_expression = "deny"
+mod_module_files = "deny"
+# module_name_repetitions = "deny"
+multiple_unsafe_ops_per_block = "deny"
+mutex_atomic = "deny"
+mutex_integer = "deny"
+non_zero_suggestions = "deny"
+panic = "deny"
+pathbuf_init_then_push = "deny"
+pattern_type_mismatch = "deny"
+precedence_bits = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+# pub_use = "deny"
+rc_buffer = "deny"
+rc_mutex = "deny"
+redundant_test_prefix = "deny"
+redundant_type_annotations = "deny"
+renamed_function_params = "deny"
+return_and_then = "deny"
+same_name_method = "deny"
+semicolon_outside_block = "deny"
+# The shadowing ruling (owner, 2026-09-03): shadowing is preferred without
+# exception, so all three shadow lints stay off in every managed project.
+# `shadow_unrelated` and `shadow_reuse` misfire in practice; `shadow_same` bars
+# only rebinding a value to itself, which the preference permits, so it is off
+# too. `shadow_reuse` is absent rather than commented because clippy allows it
+# by default. This ruling overrides the wall where they conflict. Reversal: the
+# owner withdraws the preference, and all three return together with the
+# re-binding rule in `docs/agents/rust.md` §Style that names them.
+# shadow_same = "deny"
+# shadow_unrelated = "deny"
+# single_call_fn = "deny"
+single_char_lifetime_names = "deny"
+std_instead_of_alloc = "deny"
+std_instead_of_core = "deny"
+str_to_string = "deny"
+string_add = "deny"
+string_lit_chars_any = "deny"
+string_slice = "deny"
+suspicious_xor_used_as_pow = "deny"
+tests_outside_test_module = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_self_imports = "deny"
+unreachable = "deny"
+unused_result_ok = "deny"
+unused_trait_names = "deny"
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+use_debug = "deny"
+verbose_file_reads = "deny"
+
+[workspace.lints.rust]
+deprecated-safe = "deny"
+future-incompatible = "deny"
+keyword-idents = "deny"
+let-underscore = "deny"
+nonstandard-style = "deny"
+refining-impl-trait = "deny"
+rust-2018-compatibility = "deny"
+rust-2018-idioms = "deny"
+rust-2021-compatibility = "deny"
+rust-2024-compatibility = "deny"
+# No Dylint library is loaded here, so the shared `cfg(dylint_lib)` allowance
+# is absent: an unused cfg allowance hides a typo. The three names that remain
+# are the specification backend's own enforcement cfgs, which its expansion
+# reads under the `anodized` feature.
+unexpected_cfgs = {
+  level = "deny",
+  priority = -1,
+  check-cfg = [
+    "cfg(anodized_discard_specs)",
+    "cfg(anodized_panic)",
+    "cfg(anodized_print)",
+  ]
+}
+unknown-or-malformed-diagnostic-attributes = "deny"
+# Nightly-creep guard: consumer crates have no feature exemption. A library
+# producer scopes its rustc_private expectation to the compiler-plugin crate.
+unstable_features = "deny"
+unused = "deny"
+warnings = "deny"
+
+[workspace.lints.rustdoc]
+all = { level = "deny", priority = -1 }
+# Module and item docs intentionally cross-link to private implementation items;
+# docs are always built with `--document-private-items` (the `cargo:doc` task),
+# so those targets resolve. Without this allow, the public-doc-links-to-private
+# lint would reject the project's deliberate "link to the internals" doc style.
+private_intra_doc_links = "allow"
+
+# The lint wall, as a `Cargo.toml` fragment: the three `[workspace.lints.*]`
+# tables merge into a workspace root manifest, and every member crate opts in
+# with `[lints] workspace = true`. This is the one vendored artifact that merges
+# rather than copies, because a manifest already holds the consumer's own
+# package, dependency, and profile tables.
+#
+# Each group is denied at priority -1 so an individual `allow` below it wins;
+# every allow states the class it exempts. A lint leaves this wall only with the
+# reason recorded beside it.

@@ -4,6 +4,22 @@ All notable changes to infinitum are documented here.
 
 ## Unreleased
 
+### Unreleased Features
+
+- _(engine)_ Add the infinitum driver crate
+
+### Unreleased Documentation
+
+- _(agents)_ Adopt the shared guidance and bind it to this tree
+
+### Unreleased Continuous Integration
+
+- _(github)_ Open hosted CI in the shared shape
+
+### Unreleased Configuration
+
+- _(repo)_ Adopt the shared project configuration
+
 ### Unreleased Maintenance
 
 - _(repo)_ Add .gitignore

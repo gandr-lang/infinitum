@@ -1,0 +1,36 @@
+# Naming-schema exception: this is the published-name holder — the driver the
+# crates.io reservation `infinitum` names — so the package name is the reserved
+# name rather than a derivation of its directory.
+[package]
+name = "infinitum"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "The infinitum inference engine"
+readme = "README.md"
+repository.workspace = true
+license.workspace = true
+keywords = ["cli", "engine", "inference"]
+categories = ["command-line-utilities"]
+# Publishing is manual, never automated (docs/agents/rust.md); this field is
+# the deliberate act, taken by the owner. This crate publishes to crates.io,
+# and 0.0.0 is its first release.
+publish = true
+
+[[bin]]
+name = "infinitum"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+quenchant.workspace = true
+
+[features]
+# Consumer-side opt-in to published specification instrumentation. Without it
+# the attribute and its supported nested markers are removed and ordinary code
+# remains; enabling a dependency's feature is not a substitute for declaring
+# the condition here.
+anodized = ["quenchant/anodized"]
+
+[lints]
+workspace = true
