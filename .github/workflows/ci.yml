@@ -276,11 +276,23 @@ jobs:
   # runs unconditionally — it is the job that must see a markdown-only change
   # the Rust jobs above skip. Full history, because the changelog formatter
   # generates from commits and version tags.
+  #
+  # The changelog is generated as the default branch will hold it. On a pull
+  # request the generator reconstructs the squash from the request's title and
+  # number, which is why this job gets a read token. On a merge-group entry it
+  # renders the real squash commit the queue built, so a changelog that went
+  # stale between opening and merging fails here, inside the queue, and the
+  # default branch never takes the broken state.
   format-gate:
     name: check formatting and lint gates (treefmt)
     needs: ci-image-ref
     runs-on: *linux
-    permissions: *image-read-permissions
+    # The image read is inherited; the pull-request read is this job's own,
+    # because only the changelog formatter needs it and only on that event.
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: read
     container: *ci-image # zizmor: ignore[unpinned-images]
     env:
       CI_FETCH_DEPTH: "0"
@@ -301,6 +313,11 @@ jobs:
       # cache amortize at all.
       - *install-policy-tools
       - name: treefmt --ci
+        # The credential reaches this step alone, and carries a value only on
+        # the event that spends it: the queue and push renders read the squash
+        # commit that is already in the history and ask the forge nothing.
+        env:
+          GH_TOKEN: ${{ github.event_name == 'pull_request' && secrets.GITHUB_TOKEN || '' }}
         run: mise run treefmt:check
       - name: conflict marker check
         run: mise run check:conflict-markers

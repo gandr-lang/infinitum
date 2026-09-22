@@ -63,6 +63,10 @@ weave-mcp = "github:ataraxy-labs/weave"
 # CLI use requires this pin even when no MCP server is mounted.
 "github:colbymchenry/codegraph" = "1.6.0"
 "github:crate-ci/typos" = "v1.50.0"
+# The changelog generator asks the forge for the pull request's title and
+# number, so the CLI is a gate tool here, not workstation convenience: the CI
+# image installs it and the pull-request lane needs it on PATH.
+gh = "2.101.0"
 "github:max-sixty/worktrunk" = "v0.75.0"
 "github:nextest-rs/nextest" = "cargo-nextest-0.9.143"
 "github:orhun/git-cliff" = "2.13.1"

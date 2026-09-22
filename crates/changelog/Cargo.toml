@@ -1,0 +1,19 @@
+# Workflow tooling, not a product: the changelog generator the `changelog`
+# task launches and `treefmt` calls as its changelog formatter.
+[package]
+name = "infinitum-changelog"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Squash-aware changelog generation for this repository"
+readme = "README.md"
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "infinitum-changelog"
+path = "src/main.rs"
+
+[lints]
+workspace = true
