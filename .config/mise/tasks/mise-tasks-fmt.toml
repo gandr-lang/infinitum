@@ -1,0 +1,13 @@
+#:tombi toml-version = "v1.0.0"
+#:schema https://mise.jdx.dev/schema/mise-task.json
+
+# The changelog formatter reads commit history, which changes without any
+# watched file changing, so both tasks run with treefmt's content cache off:
+# `--ci` implies `--no-cache` alongside `--fail-on-change`.
+[treefmt]
+description = "Run treefmt"
+run = "treefmt --no-cache"
+
+["treefmt:check"]
+description = "Run treefmt in CI mode"
+run = "treefmt --ci"
