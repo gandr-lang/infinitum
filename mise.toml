@@ -1,0 +1,95 @@
+#:tombi toml-version = "v1.1.0"
+#:schema https://mise.jdx.dev/schema/mise.json
+# The published mise schema omits several live `settings` keys; strict mode
+# would reject them.
+#:tombi schema.strict = false
+
+# The lockfile beside this file is format version 2; a mise older than this
+# cannot read it and silently resolves tools unlocked.
+min_version = "2026.9.12"
+
+[settings]
+activate_aggressive = true
+experimental = true
+env_shell_expand = true
+minimum_release_age = "1d"
+lockfile = true
+
+[settings.cargo]
+binstall = true
+# mise's built-in binstall: fetches crate binaries itself, no external
+# cargo-binstall needed — without it, CI falls back to `cargo install`
+# source builds for every cargo pin.
+binstall_native = true
+# mise disables cargo-quickinstall by default (jdx/mise PR 10923), so pins
+# without crate-author binstall artifacts compile from source (~20 min CI
+# lanes). Owner-accepted trust boundary: quickinstall's third-party binaries.
+binstall_quickinstall = true
+
+[settings.npm]
+package_manager = "aube"
+
+[env]
+# Resolves rustup from PATH, else from its fixed install dir ($CARGO_HOME/bin,
+# default ~/.cargo/bin), so activation never depends on the launching shell's
+# PATH. Fails loudly when rustup is absent from both: a nonexistent-path
+# fallback would let a Homebrew cargo keep resolving while RUSTUP_TOOLCHAIN
+# silently binds nothing. The resolved dir must also carry the executable
+# cargo/rustc proxy pair: a dir that resolves rustup but lacks the proxies
+# (a partial install, a stale PATH entry) would keep cargo/rustc resolving
+# to distribution copies while the pin points at nothing.
+_.path = ["{{ exec(command='r=$(command -v rustup) || r=\"${CARGO_HOME:-$HOME/.cargo}/bin/rustup\"; [ -x \"$r\" ] || { echo \"rustup required: the pinned toolchains resolve through it\" >&2; exit 1; }; d=$(dirname \"$r\"); if [ ! -x \"$d/cargo\" ] || [ ! -x \"$d/rustc\" ]; then echo \"the rustup dir $d lacks the executable cargo/rustc proxies: the pinned toolchains resolve through the proxy pair\" >&2; exit 1; fi; printf \"%s\" \"$d\"') }}"]
+
+[task_config]
+includes = [".config/mise/tasks"]
+
+[tool_alias]
+weave-mcp = "github:ataraxy-labs/weave"
+
+# Every tool that publishes cross-platform release binaries installs through
+# the github backend: a cargo: pin is a source build the moment binstall
+# resolution misses, and that hazard recurs with every upstream default
+# change.
+#
+# The formatter pins below are the floor: `treefmt.toml` names each of them by
+# command, and treefmt refuses to start when a configured formatter's command
+# is absent, so a pin and its formatter entry move together. This tree carries
+# no Dylint policy and no shell sources, so the Dylint and shellcheck pins the
+# shared set offers are absent along with their formatter entry.
+[tools]
+"cargo:tirith" = "0.4.0"
+"github:aubepkg/aube" = "2.2.4"
+# Retain across languages: project setup initializes the source index.
+# CLI use requires this pin even when no MCP server is mounted.
+"github:colbymchenry/codegraph" = "1.6.0"
+"github:crate-ci/typos" = "v1.50.0"
+"github:max-sixty/worktrunk" = "v0.75.0"
+"github:nextest-rs/nextest" = "cargo-nextest-0.9.143"
+"github:orhun/git-cliff" = "2.13.1"
+"github:numtide/treefmt" = "2.5.0"
+"github:j178/prek" = "v0.5.0"
+"github:rvben/rumdl" = "0.2.62"
+"github:tombi-toml/tombi" = "1.5.0"
+"npm:@commitlint/cli" = "21.2.2"
+"npm:oxfmt" = "0.65.0"
+node = "26.8.1"
+
+# MCP servers mounted by .mcp.json — pinned here so the bare commands the
+# harnesses execute resolve reproducibly, not from whatever the host happens
+# to have. aifix has no registry release at HEAD; the rev pins its git build.
+[tools."cargo:silvanshade/aifix"]
+crate = "aifix"
+version = "rev:acefe2f51f855b33bb7d12122f8af68a302edf0c"
+
+# sizelint publishes no release binaries; the one remaining source build.
+[tools."cargo:sizelint"]
+version = "0.1.5"
+
+# Local workflow runner, so a workflow change is testable without a push.
+[tools."github:nektos/act"]
+version = "0.2.89"
+
+[tools.weave-mcp]
+version = "v0.5.2"
+matching = "weave-mcp"
+rename_exe = "weave-mcp"

@@ -1,0 +1,324 @@
+# <critical>
+# MUST preserve anchor-first CI: maximal sharing, no copied orchestration.
+# New functionality MUST reuse template anchors or add anchors for likely reuse.
+# MUST parameterize differences; performance exceptions require measured evidence.
+# Share exceptional logic through actions; preserve parallelism, caches, and gates.
+# </critical>
+name: CI
+
+on:
+  pull_request: {}
+  # Redundant as a gate once the queue lands every commit — the merge-group run
+  # already tested this exact tree — but kept as the cache warmer. Actions
+  # caches are restorable only from the run's own branch, its base, and the
+  # default branch, and a merge-group run's branch is an ephemeral
+  # `gh-readonly-queue/*` ref, deleted at merge and a sibling of every PR
+  # branch. A run on main is therefore the only writer of a cache later PRs can
+  # read. Nothing slimmer works: the jobs that build are the jobs that save.
+  push:
+    branches: [main]
+  merge_group: {}
+
+permissions:
+  contents: read
+
+# pull_request only: cancelling a push-to-main run would cancel the run that
+# saves the shared caches PR branches read from, mid-merge.
+# merge_group is naturally exempt either way: github.ref there is the
+# queue's own per-entry temporary ref (refs/heads/gh-readonly-queue/...), so
+# each queue entry already gets a distinct concurrency group and can never
+# collide with, or be cancelled by, another one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  # The mise.toml nextest pin; no gate enforces the match here yet.
+  CARGO_NEXTEST_VERSION: "0.9.143"
+
+  # Opt back into quickinstall (jdx/mise PR 10923 flipped the default off) and
+  # mise's built-in binstall, in env form so both bind regardless of
+  # settings-file scoping.
+  MISE_CARGO_BINSTALL_QUICKINSTALL: "true"
+  MISE_CARGO_BINSTALL_NATIVE: "true"
+  # The MCP server pins are workstation mounts, not CI tools; the aifix git
+  # build needs system libacl the runner lacks, so mise skips it here.
+  # mise.toml is the workstation manifest; CI installs its CI subset. The
+  # names after aifix are workstation tools (MCP servers, the worktree and
+  # hook tooling, act, commitlint) that no job invokes; the CI image
+  # asserts this list against its own at build time.
+  MISE_DISABLE_TOOLS: "cargo:silvanshade/aifix,cargo:tirith,github:colbymchenry/codegraph,github:max-sixty/worktrunk,github:nektos/act,github:j178/prek,npm:@commitlint/cli,weave-mcp"
+  # The switch for the Linux container image: the published image's pin-file
+  # hash, empty by default. While empty, the Rust jobs below resolve to no
+  # container and the setup-rust steps stay the toolchain source, the fallback
+  # while the image is unproven. The repository variable flips it to the
+  # image's tag once the first image build is green, with no workflow edit;
+  # act accepts the same variable.
+  INFINITUM_CI_IMAGE: ${{ vars.INFINITUM_CI_IMAGE }}
+
+jobs:
+  # Definitions only: aliases run in each consuming job's context.
+  template:
+    if: false
+    needs: &rust-needs [changes, ci-image-ref]
+    runs-on: &linux ubuntu-latest
+    # Private-GHCR consumers need package reads on the job; the workflow floor
+    # stays `contents: read` for every job that pulls no image.
+    permissions: &image-read-permissions
+      contents: read
+      packages: read
+    steps:
+      # Checkout stays shallow except where a gate needs history.
+      - &git-checkout
+        name: git checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ env.CI_FETCH_DEPTH || '1' }}
+      # Inside the CI image the toolchain is baked; only the caches run. A
+      # lane off the image's platform overrides the switch: no container runs
+      # there whatever the repository variable says, so its toolchain install
+      # is unconditional.
+      #
+      # Cache writing is the lane's own decision, relayed through CI_CACHE_SAVE
+      # and defaulting off: the heavy lanes are the writers, every other lane
+      # is a restore-only consumer of what they wrote.
+      - &setup-rust
+        name: setup rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+        with:
+          install-toolchain: ${{ env.CI_INSTALL_TOOLCHAIN || needs.ci-image-ref.outputs.ref == '' }}
+          cache-save: ${{ env.CI_CACHE_SAVE || 'false' }}
+          # Keeping the workspace crates in the cache lets cargo's fingerprints
+          # no-op the unchanged ones on restore.
+          cache-workspace-crates: true
+      - &install-tools
+        name: install job tools
+        if: ${{ env.CI_INSTALL_TOOLS != 'false' }}
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        # Tool sets resolve here: job-level env cannot reference workflow env.
+        env:
+          CI_TOOLS_NEXTEST: cargo-nextest@${{ env.CARGO_NEXTEST_VERSION }}
+          CI_TOOLS_ZIZMOR: zizmor
+        with:
+          tool: ${{ env[env.CI_TOOLS] }}
+      # Install the whole CI subset in the cached setup step: later mise
+      # auto-installs otherwise escape that cache.
+      - &install-policy-tools
+        name: install mise-managed policy tools
+        if: &without-image ${{ needs.ci-image-ref.outputs.ref == '' }}
+        # The pinned mise must read mise.lock's format version 2; an older one
+        # warns and resolves every tool unlocked. The CI image parses this
+        # step for the version it bakes, so the two cannot drift.
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.9.12
+      - &upload-test-report
+        name: upload test report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.CI_REPORT_NAME }}
+          path: ${{ env.CI_REPORT_PATH }}
+          if-no-files-found: ignore
+
+  # Always trigger the workflow: a skipped workflow supplies no required
+  # check, whereas a skipped job succeeds. Formatting sees docs-only changes.
+  changes:
+    name: detect changed-file categories
+    runs-on: *linux
+    outputs:
+      # Missing bases and failed fetches/diffs force Rust checks, never skip
+      # them. The queue always checks its complete merge result.
+      rust: ${{ github.event_name == 'merge_group' || steps.fetch.outcome != 'success' || steps.filter.outcome != 'success' || steps.filter.outputs.rust == 'true' }}
+    env:
+      CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - *git-checkout
+      - id: fetch
+        name: fetch the comparison tree
+        if: ${{ github.event_name != 'merge_group' }}
+        continue-on-error: true
+        run: git fetch --depth=1 origin "$CI_BASE_SHA"
+      - id: filter
+        name: filter changed paths
+        if: ${{ github.event_name != 'merge_group' && steps.fetch.outcome == 'success' }}
+        continue-on-error: true
+        # One pipeline, no shell control flow or third-party filter action.
+        # NUL framing preserves filenames; no-renames retains source deletions.
+        # pipefail makes a failed diff distinguishable from an empty diff.
+        shell: bash
+        run: >-
+          git diff --no-renames --name-only -z "$CI_BASE_SHA" HEAD |
+          jq -rRs '"rust=" + (split("\u0000") | any(length > 0 and ((endswith(".md") or startswith("docs/") or startswith("LICENSE") or . == ".gitignore") | not)) | tostring)'
+          >> "$GITHUB_OUTPUT"
+
+  # container cannot read env directly; needs carries the workflow switch.
+  ci-image-ref:
+    name: resolve the CI image reference
+    runs-on: *linux
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - id: resolve
+        name: resolve the image reference
+        run: echo "ref=${INFINITUM_CI_IMAGE:+ghcr.io/gandr-lang/infinitum-ci:${INFINITUM_CI_IMAGE}}" >> "$GITHUB_OUTPUT"
+
+  # `push` is in the condition, not just `merge_group`, because the push-to-main
+  # run is the cache warmer: caches are readable only from the current branch,
+  # its base, and the default branch, and a merge-group run's branch is an
+  # ephemeral `gh-readonly-queue/*` ref that is a sibling of every PR branch and
+  # is deleted at merge. Only a run on main writes a cache any later PR can
+  # read, and only this job and the platform lanes write one at all (their
+  # `cache-save` inputs on the setup-rust action above).
+  cargo-build-crate:
+    name: build and test the crate
+    needs: *rust-needs
+    if: &heavy-lane ${{ needs.changes.outputs.rust == 'true' && (github.event_name == 'merge_group' || github.event_name == 'push') }}
+    runs-on: *linux
+    permissions: *image-read-permissions
+    # The relayed tag hashes the three pin files; the base is digest-pinned.
+    container: &ci-image ${{ needs.ci-image-ref.outputs.ref }} # zizmor: ignore[unpinned-images]
+    env:
+      # The one writer of the shared rustup and dependency caches, and only on
+      # the push event — which this workflow takes from `main` alone. A save on
+      # a merge-group entry would land on that queue's ephemeral
+      # `gh-readonly-queue/*` ref, which nothing later can read, so the queue
+      # stays a restore-only consumer of what the last main push wrote.
+      CI_CACHE_SAVE: ${{ github.event_name == 'push' }}
+      CI_INSTALL_TOOLS: *without-image
+      CI_TOOLS: CI_TOOLS_NEXTEST
+      CI_REPORT_NAME: junit-linux
+      CI_REPORT_PATH: target/nextest/ci/junit.xml
+    steps:
+      - *git-checkout
+      - *setup-rust
+      - *install-tools
+      - &cargo-build
+        name: build every target
+        run: cargo build --locked --all-targets
+      - &cargo-test
+        name: test the crate
+        run: cargo nextest run --locked --profile ci --workspace
+      - name: test the crate in release
+        run: cargo nextest run --locked --profile ci --workspace --release
+      # The declared consumer-side feature is exercised, not merely declared:
+      # enforcement turns the published specification markers into checks.
+      - name: test the crate with enforcement
+        env:
+          RUSTFLAGS: --cfg anodized_panic
+        run: cargo nextest run --locked --profile ci --workspace --features anodized
+      - name: check private-item rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps --document-private-items
+      - *upload-test-report
+
+  # Platform independence is this engine's thesis, so the test suite runs on
+  # every host the driver claims. No image exists off linux/amd64: these lanes
+  # install the pinned toolchain themselves.
+  cargo-test-platforms:
+    name: test the crate (${{ matrix.platform }})
+    needs: *rust-needs
+    if: *heavy-lane
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-latest
+          - platform: windows-x64
+            runner: windows-latest
+          - platform: windows-arm64
+            runner: windows-11-arm
+    env:
+      # The push-to-main run is these lanes' cache writer; a merge-group save
+      # lands on the queue's ephemeral ref and is readable by nothing later,
+      # and without a writer the lanes rebuild cold every run. The rustup key
+      # and the rust-cache key both carry the runner's OS and architecture, so
+      # the lanes cannot contaminate one another or the Linux lane above.
+      CI_CACHE_SAVE: ${{ github.event_name == 'push' }}
+      CI_INSTALL_TOOLCHAIN: "true"
+      CI_TOOLS: CI_TOOLS_NEXTEST
+      CI_REPORT_NAME: junit-${{ matrix.platform }}
+      CI_REPORT_PATH: target/nextest/ci/junit.xml
+    steps:
+      - *git-checkout
+      - *setup-rust
+      - *install-tools
+      - *cargo-build
+      - *cargo-test
+      - *upload-test-report
+
+  cargo-clippy-crate:
+    name: check Clippy wall
+    needs: *rust-needs
+    if: &rust-lane ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: *linux
+    permissions: *image-read-permissions
+    container: *ci-image # zizmor: ignore[unpinned-images]
+    steps:
+      - *git-checkout
+      # Restore-only: the heavy lanes are the cache writers. The workspace
+      # crates stay in the restored cache so this lane's check artifacts no-op.
+      - *setup-rust
+      - name: lint every target
+        run: cargo clippy --locked --workspace --all-targets -- --deny warnings
+      - name: lint every target with the published instrumentation
+        run: cargo clippy --locked --workspace --all-targets --features anodized -- --deny warnings
+
+  # The CI consumer for the treefmt/rumdl/typos/sizelint/tombi/oxfmt configs:
+  # covers markdown, TOML, JSON/YAML and Rust formatting in one pass, so it
+  # runs unconditionally — it is the job that must see a markdown-only change
+  # the Rust jobs above skip. Full history, because the changelog formatter
+  # generates from commits and version tags.
+  format-gate:
+    name: check formatting and lint gates (treefmt)
+    needs: ci-image-ref
+    runs-on: *linux
+    permissions: *image-read-permissions
+    container: *ci-image # zizmor: ignore[unpinned-images]
+    env:
+      CI_FETCH_DEPTH: "0"
+    steps:
+      - *git-checkout
+      # The pinned toolchain for treefmt's rustfmt pass; restore-only, because
+      # the heavy lanes are the cache writers.
+      - *setup-rust
+      # Unscoped: `mise install` here pulls the full mise.toml tool list, not
+      # just the formatters treefmt invokes. Measured why scoping is wrong:
+      # with install_args limited to treefmt's own tools, `mise run` in the
+      # next step still auto-installs the rest of mise.toml's tools on demand —
+      # but jdx/mise-action's cache save already ran at the end of *this*
+      # step, before that auto-install happened, so the later cost is never
+      # captured and gets re-paid in full on every run (measured at ~9m37s in
+      # the source repository this shape comes from). Installing everything
+      # here, inside the one step the cache actually covers, is what makes the
+      # cache amortize at all.
+      - *install-policy-tools
+      - name: treefmt --ci
+        run: mise run treefmt:check
+      - name: conflict marker check
+        run: mise run check:conflict-markers
+      # The shared baseline page is excluded from every formatter above, so
+      # the treefmt pass cannot see a byte change in it. The content pin is
+      # what does, and this is the job that always runs.
+      - name: baseline hash check
+        run: mise run check:baseline-hash
+
+  workflow-lint:
+    name: check workflow lints (zizmor)
+    runs-on: *linux
+    env:
+      CI_TOOLS: CI_TOOLS_ZIZMOR
+    steps:
+      - *git-checkout
+      - *install-tools
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: zizmor .github/workflows

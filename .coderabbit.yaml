@@ -1,0 +1,21 @@
+language: "en-US"
+tone_instructions: "Terse comments: state the issue, then the fix. No praise, no filler, no rhetorical questions."
+reviews:
+  profile: "quiet"
+  request_changes_workflow: false
+  high_level_summary: true
+  review_details: false
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 2
+    ignore_title_keywords:
+      - "WIP"
+      - "[skip review]"
+  path_filters:
+    - "!target/**"
+  path_instructions:
+    - path: "crates/**/*.rs"
+      instructions: "Rust workspace, edition 2024; clippy and rustfmt enforced in CI. Prefer minimal diffs; flag correctness, safety, performance, and API design only."

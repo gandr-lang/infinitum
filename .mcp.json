@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "aifix": {
+      "type": "stdio",
+      "command": "aifix",
+      "args": ["mcp"]
+    },
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": ["serve", "--mcp"]
+    },
+    "tirith": {
+      "type": "stdio",
+      "command": "tirith",
+      "args": ["mcp-server"]
+    },
+    "weave": {
+      "type": "stdio",
+      "command": "weave-mcp",
+      "args": []
+    }
+  }
+}
