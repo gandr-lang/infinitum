@@ -2,23 +2,96 @@
 //!
 //! Installs as `infinitum`. The driver owns the argument surface and the
 //! process boundary: it parses an invocation, renders the outcome, and leaves.
-//! The engine itself arrives here as it lands; until then the one accepted
-//! invocation renders the driver's own help, so the binary's observable
-//! surface is exactly what `--help` and `--version` describe.
+//! A bare invocation renders the driver's own help. `infinitum generate` runs
+//! one prompt through the ninfer engine's C facade, loaded at run time, and
+//! prints the prompt's ids, the greedy continuation's ids, and its text: the
+//! reference an implementation of the same model is compared against.
+
+extern crate alloc;
+
+mod generate;
+mod ninfer;
 
 use std::io::Write as _;
 
 /// The infinitum command line.
 #[derive(Debug, clap::Parser)]
 #[command(name = "infinitum", version, about)]
-struct Cli;
+struct Cli
+{
+    /// The command to run; absent, the driver renders its help.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// The driver's commands.
+#[derive(Debug, clap::Subcommand)]
+enum Command
+{
+    /// Run one prompt through ninfer's C facade: tokenize, generate greedily,
+    /// and print the ids and the generated text.
+    Generate(generate::Request),
+}
+
+/// A failure of an invocation.
+#[derive(Debug)]
+enum DriverFailure
+{
+    /// The request failed.
+    Request(generate::RequestFailure),
+    /// Writing the help or flushing the output failed.
+    Output(std::io::Error),
+}
+
+impl From<generate::RequestFailure> for DriverFailure
+{
+    /// Wrap a request failure.
+    ///
+    /// # Specification
+    /// trivial.
+    fn from(failure: generate::RequestFailure) -> Self
+    {
+        return Self::Request(failure);
+    }
+}
+
+impl From<std::io::Error> for DriverFailure
+{
+    /// Wrap an output failure.
+    ///
+    /// # Specification
+    /// trivial.
+    fn from(failure: std::io::Error) -> Self
+    {
+        return Self::Output(failure);
+    }
+}
+
+impl core::fmt::Display for DriverFailure
+{
+    /// Render the failure through its own rendering.
+    ///
+    /// # Specification
+    /// trivial.
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result
+    {
+        return match *self {
+            | Self::Request(ref failure) => core::fmt::Display::fmt(failure, f),
+            | Self::Output(ref failure) => write!(f, "cannot write the output: {failure}"),
+        };
+    }
+}
 
 /// Build the command definition the driver renders its help from.
 ///
 /// # Specification
 /// - requires: nothing of the caller.
 /// - ensures: the returned command carries the driver's own name, its version
-///   from the package metadata, and the flags clap derives for [`Cli`].
+///   from the package metadata, and the flags and subcommands clap derives for
+///   [`Cli`].
 /// - provides: the single source of the help text, so the rendered text and the
 ///   parsed grammar cannot describe different commands.
 /// - fails: never; the definition is derived at compile time.
@@ -44,8 +117,7 @@ fn command() -> clap::Command
 ///   a failure, not a precondition violation.
 /// - ensures: on success the whole long-help rendering of [`command`] has been
 ///   written to `out`, and nothing else.
-/// - provides: the driver's entire observable output while the engine has no
-///   invocation of its own.
+/// - provides: the driver's output for a bare invocation.
 /// - fails: returns the writer's error unchanged, so a closed or full
 ///   destination surfaces at the call site rather than aborting the process.
 /// - panics: none. The rendering goes through the fallible writer rather than
@@ -67,40 +139,87 @@ where
     return command().write_long_help(out);
 }
 
-/// Parse the driver's arguments and render the outcome.
+/// Run a parsed invocation, writing its output to `out`.
 ///
 /// # Specification
-/// - requires: nothing of the caller; the arguments come from the process
-///   environment and the only accepted form is argument-free.
-/// - ensures: [`Cli`] parses before anything is written, so `--help`,
-///   `--version`, and an argument error take clap's own exit path, and the help
-///   rendering is reached only on a bare `infinitum` invocation.
-/// - provides: the long help on standard output, flushed before the process
-///   returns.
-/// - fails: returns the write or flush error when standard output is closed,
-///   full, or otherwise unwritable; the runtime reports it and exits nonzero.
-/// - panics: none. The handle is locked once and written through fallible
-///   calls; clap leaves by process exit rather than by panic on `--help`,
-///   `--version`, and argument errors.
+/// - requires: `out` accepts bytes.
+/// - ensures: with no command, `out` holds the long help; with `generate`, it
+///   holds the request's rendering; either way `out` is flushed on success.
+/// - provides: the driver's behavior, apart from the process boundary.
+/// - fails: with the request's failure, or with the writer's error.
+/// - panics: none.
 ///
 /// # Errors
-/// - [`std::io::Error`]: the underlying failure from writing the help text to
-///   standard output, or from the flush that follows it.
-fn main() -> Result<(), std::io::Error>
+/// - [`DriverFailure::Request`]: the request failed.
+/// - [`DriverFailure::Output`]: writing or flushing `out` failed.
+///
+/// # Adequacy
+/// - hypothesis: L3 over the two command shapes — none renders help, and
+///   `generate` reaches the request, observed by its first failure without a
+///   facade library.
+/// - witness: `tests::a_bare_invocation_renders_help`
+/// - witness: `tests::generate_reaches_the_request`
+fn run<Writer>(
+    cli: Cli,
+    out: &mut Writer,
+) -> Result<(), DriverFailure>
+where
+    Writer: std::io::Write,
 {
-    let _cli = <Cli as clap::Parser>::parse();
-    let mut stdout = std::io::stdout().lock();
-    render_long_help(&mut stdout)?;
-    stdout.flush()?;
+    match cli.command {
+        | None => render_long_help(out)?,
+        | Some(Command::Generate(request)) => generate::run(&request, out)?,
+    }
+    out.flush()?;
     return Ok(());
 }
 
-/// Tests for the driver's command definition and its rendered help.
+/// Parse the driver's arguments, run them, and report a failure on standard
+/// error.
+///
+/// # Specification
+/// - requires: nothing of the caller; the arguments come from the process
+///   environment.
+/// - ensures: [`Cli`] parses before anything is written, so `--help`,
+///   `--version`, and an argument error take clap's own exit path; otherwise
+///   [`run`]'s output is on standard output, and a failure is one `error: `
+///   line on standard error through its `Display` rendering.
+/// - provides: the process boundary: success exits zero, failure nonzero.
+/// - fails: never as a function; a failure becomes the exit status.
+/// - panics: none. The handles are locked once and written through fallible
+///   calls; clap leaves by process exit rather than by panic on `--help`,
+///   `--version`, and argument errors.
+///
+/// # Adequacy
+/// - hypothesis: none in the suite — the boundary is a process, and [`run`]'s
+///   witnesses carry the behavior; the device smoke runs the binary.
+fn main() -> std::process::ExitCode
+{
+    let cli = <Cli as clap::Parser>::parse();
+    let mut stdout = std::io::stdout().lock();
+    let outcome = run(cli, &mut stdout);
+    drop(stdout);
+    if let Err(failure) = outcome {
+        let mut stderr = std::io::stderr().lock();
+        let written = writeln!(stderr, "error: {failure}");
+        drop(written);
+        return std::process::ExitCode::FAILURE;
+    }
+    return std::process::ExitCode::SUCCESS;
+}
+
+/// Tests for the driver's command definition, its rendered help, and its
+/// dispatch.
 #[cfg(test)]
 mod tests
 {
+    use super::Cli;
+    use super::DriverFailure;
     use super::command;
     use super::render_long_help;
+    use super::run;
+    use crate::generate::RequestFailure;
+    use crate::ninfer::NinferFailure;
 
     /// The command renders under the name the binary installs as.
     #[test]
@@ -126,7 +245,7 @@ mod tests
     }
 
     /// The rendered long help describes this driver: its usage line names the
-    /// binary, and the flags clap derives are listed.
+    /// binary, and the flags and the command clap derives are listed.
     #[test]
     fn long_help_describes_the_driver()
     {
@@ -144,6 +263,86 @@ mod tests
         assert!(
             rendered.contains("--version"),
             "the help lists the version flag: {rendered}"
+        );
+        assert!(
+            rendered.contains("generate"),
+            "the help lists the generate command: {rendered}"
+        );
+    }
+
+    /// A bare invocation writes the long help.
+    #[test]
+    fn a_bare_invocation_renders_help()
+    {
+        let cli = <Cli as clap::Parser>::try_parse_from(["infinitum"]).unwrap();
+        let mut out = Vec::new();
+        run(cli, &mut out).unwrap();
+        let mut expected = Vec::new();
+        render_long_help(&mut expected).unwrap();
+        assert_eq!(out, expected, "the output is exactly the long help");
+    }
+
+    /// `generate` runs the request, observed through its first failure when
+    /// the facade library is absent.
+    #[test]
+    fn generate_reaches_the_request()
+    {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "infinitum",
+            "generate",
+            "--library",
+            "no-such-directory/libninfer_capi.so",
+            "--artifact",
+            "model.ninfer",
+            "hello",
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let failed = run(cli, &mut out);
+        assert!(
+            matches!(
+                failed,
+                Err(DriverFailure::Request(RequestFailure::Ninfer(
+                    NinferFailure::Load { .. }
+                )))
+            ),
+            "the request's load failure is reported: {failed:?}"
+        );
+    }
+
+    /// A zero token budget is an argument error, before anything runs.
+    #[test]
+    fn a_zero_budget_is_an_argument_error()
+    {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "infinitum",
+            "generate",
+            "--library",
+            "libninfer_capi.so",
+            "--artifact",
+            "model.ninfer",
+            "--max-new-tokens",
+            "0",
+            "hello",
+        ]);
+        let failure = parsed.unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "zero is refused as a value"
+        );
+    }
+
+    /// The library, the artifact and the prompt are required.
+    #[test]
+    fn generate_requires_its_library_artifact_and_prompt()
+    {
+        let parsed = <Cli as clap::Parser>::try_parse_from(["infinitum", "generate", "hello"]);
+        let failure = parsed.unwrap_err();
+        assert_eq!(
+            failure.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "the missing paths are reported"
         );
     }
 }

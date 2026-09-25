@@ -31,6 +31,17 @@ version = "4.6.6"
 default-features = false
 features = ["derive", "error-context", "help", "std", "usage"]
 
+# Run-time loading of a shared library and lookup of its symbols, across the
+# platforms' loaders. It is how the driver reaches an external engine's C
+# facade without linking it, so a build needs no engine on the machine. `std`
+# is the one feature, and it is what accepts a `Path` as the library name.
+# consumers:
+# - infinitum
+[workspace.dependencies.libloading]
+version = "0.9.0"
+default-features = false
+features = ["std"]
+
 # The specification attribute: `#[quenchant::spec(...)]` states an obligation
 # beside the code it constrains. The release is a pre-release, so the
 # requirement names it exactly; a caret requirement would not match it at all.
