@@ -14,6 +14,13 @@ experimental = true
 env_shell_expand = true
 minimum_release_age = "1d"
 lockfile = true
+# Rust resolves through mise's rust backend: `rust-toolchain.toml` stays the one
+# channel pin, mise installs it through rustup, sets RUSTUP_TOOLCHAIN from it,
+# and places the rustup proxy dir among its own tool paths, after the shims and
+# ahead of the inherited PATH. No project `_.path` entry: a dir that config puts
+# on PATH sits ahead of every mise tool, and a distribution rustup lives in
+# /usr/bin, which would shadow every pin.
+idiomatic_version_file_enable_tools = ["rust"]
 
 [settings.cargo]
 binstall = true
@@ -28,17 +35,6 @@ binstall_quickinstall = true
 
 [settings.npm]
 package_manager = "aube"
-
-[env]
-# Resolves rustup from PATH, else from its fixed install dir ($CARGO_HOME/bin,
-# default ~/.cargo/bin), so activation never depends on the launching shell's
-# PATH. Fails loudly when rustup is absent from both: a nonexistent-path
-# fallback would let a Homebrew cargo keep resolving while RUSTUP_TOOLCHAIN
-# silently binds nothing. The resolved dir must also carry the executable
-# cargo/rustc proxy pair: a dir that resolves rustup but lacks the proxies
-# (a partial install, a stale PATH entry) would keep cargo/rustc resolving
-# to distribution copies while the pin points at nothing.
-_.path = ["{{ exec(command='r=$(command -v rustup) || r=\"${CARGO_HOME:-$HOME/.cargo}/bin/rustup\"; [ -x \"$r\" ] || { echo \"rustup required: the pinned toolchains resolve through it\" >&2; exit 1; }; d=$(dirname \"$r\"); if [ ! -x \"$d/cargo\" ] || [ ! -x \"$d/rustc\" ]; then echo \"the rustup dir $d lacks the executable cargo/rustc proxies: the pinned toolchains resolve through the proxy pair\" >&2; exit 1; fi; printf \"%s\" \"$d\"') }}"]
 
 [task_config]
 includes = [".config/mise/tasks"]
