@@ -3,14 +3,12 @@
 //! Installs as `infinitum`. The driver owns the argument surface and the
 //! process boundary: it parses an invocation, renders the outcome, and leaves.
 //! A bare invocation renders the driver's own help. `infinitum generate` runs
-//! one prompt through the ninfer engine's C facade, loaded at run time, and
-//! prints the prompt's ids, the greedy continuation's ids, and its text: the
-//! reference an implementation of the same model is compared against.
-
-extern crate alloc;
+//! one prompt through infinitum's DFlash2 round on ninfer's Engine and prints
+//! the prompt's ids, the greedy continuation's ids, its text, and the round
+//! tallies: the reference an implementation of the same model is compared
+//! against.
 
 mod generate;
-mod ninfer;
 
 use std::io::Write as _;
 
@@ -28,8 +26,9 @@ struct Cli
 #[derive(Debug, clap::Subcommand)]
 enum Command
 {
-    /// Run one prompt through ninfer's C facade: tokenize, generate greedily,
-    /// and print the ids and the generated text.
+    /// Run one prompt through infinitum's DFlash2 round on ninfer: plan,
+    /// tokenize, generate greedily, and print the ids, the text, and the round
+    /// tallies.
     Generate(generate::Request),
 }
 
@@ -155,8 +154,7 @@ where
 ///
 /// # Adequacy
 /// - hypothesis: L3 over the two command shapes — none renders help, and
-///   `generate` reaches the request, observed by its first failure without a
-///   facade library.
+///   `generate` reaches the request, observed by its planning refusal.
 /// - witness: `tests::a_bare_invocation_renders_help`
 /// - witness: `tests::generate_reaches_the_request`
 fn run<Writer>(
@@ -213,13 +211,14 @@ fn main() -> std::process::ExitCode
 #[cfg(test)]
 mod tests
 {
+    use infinitum_round::RefusalReason;
+
     use super::Cli;
     use super::DriverFailure;
     use super::command;
     use super::render_long_help;
     use super::run;
     use crate::generate::RequestFailure;
-    use crate::ninfer::NinferFailure;
 
     /// The command renders under the name the binary installs as.
     #[test]
@@ -282,18 +281,17 @@ mod tests
         assert_eq!(out, expected, "the output is exactly the long help");
     }
 
-    /// `generate` runs the request, observed through its first failure when
-    /// the facade library is absent.
+    /// `generate` runs the request, observed through its planning refusal.
     #[test]
     fn generate_reaches_the_request()
     {
         let cli = <Cli as clap::Parser>::try_parse_from([
             "infinitum",
             "generate",
-            "--library",
-            "no-such-directory/libninfer_capi.so",
             "--artifact",
             "model.ninfer",
+            "--draft-width",
+            "16",
             "hello",
         ])
         .unwrap();
@@ -302,11 +300,10 @@ mod tests
         assert!(
             matches!(
                 failed,
-                Err(DriverFailure::Request(RequestFailure::Ninfer(
-                    NinferFailure::Load { .. }
-                )))
+                Err(DriverFailure::Request(RequestFailure::Plan(ref refusal)))
+                    if matches!(refusal.reason(), RefusalReason::UnsupportedWidth(_))
             ),
-            "the request's load failure is reported: {failed:?}"
+            "the request's planning refusal is reported: {failed:?}"
         );
     }
 
@@ -317,8 +314,6 @@ mod tests
         let parsed = <Cli as clap::Parser>::try_parse_from([
             "infinitum",
             "generate",
-            "--library",
-            "libninfer_capi.so",
             "--artifact",
             "model.ninfer",
             "--max-new-tokens",
@@ -333,16 +328,16 @@ mod tests
         );
     }
 
-    /// The library, the artifact and the prompt are required.
+    /// The artifact and the prompt are required.
     #[test]
-    fn generate_requires_its_library_artifact_and_prompt()
+    fn generate_requires_its_artifact_and_prompt()
     {
         let parsed = <Cli as clap::Parser>::try_parse_from(["infinitum", "generate", "hello"]);
         let failure = parsed.unwrap_err();
         assert_eq!(
             failure.kind(),
             clap::error::ErrorKind::MissingRequiredArgument,
-            "the missing paths are reported"
+            "the missing artifact is reported"
         );
     }
 }

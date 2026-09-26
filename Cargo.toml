@@ -31,16 +31,39 @@ version = "4.6.6"
 default-features = false
 features = ["derive", "error-context", "help", "std", "usage"]
 
-# Run-time loading of a shared library and lookup of its symbols, across the
-# platforms' loaders. It is how the driver reaches an external engine's C
-# facade without linking it, so a build needs no engine on the machine. `std`
-# is the one feature, and it is what accepts a `Path` as the library name.
+# The Rust–C++ bridge (owner ruling 2026-09-25: infinitum reaches C++ engines
+# through a minimal `cxx` bridge it designs). `cxx` checks both sides of each
+# declared signature and generates the C++ header; `std` is the one feature,
+# for `String` and `Vec` across the boundary. The C++ standard is set by the
+# build script, not by the `c++*` features.
 # consumers:
-# - infinitum
-[workspace.dependencies.libloading]
-version = "0.9.0"
+# - infinitum-ninfer (feature `engine`)
+[workspace.dependencies.cxx]
+version = "1.0.202"
 default-features = false
 features = ["std"]
+
+# The build-time half of the bridge: generates the C++ side of a
+# `#[cxx::bridge]` module and compiles it with the adapter sources. No
+# feature is needed; `parallel` only speeds a many-file build.
+# consumers:
+# - infinitum-ninfer (feature `engine`)
+[workspace.dependencies.cxx-build]
+version = "1.0.202"
+default-features = false
+
+# The ninfer backend: DFlash2 planning, and the Engine behind `engine`.
+# consumers:
+# - infinitum (feature `ninfer`)
+[workspace.dependencies.infinitum-ninfer]
+path = "crates/ninfer"
+
+# The speculative round as a graph of fragments.
+# consumers:
+# - infinitum
+# - infinitum-ninfer
+[workspace.dependencies.infinitum-round]
+path = "crates/round"
 
 # The specification attribute: `#[quenchant::spec(...)]` states an obligation
 # beside the code it constrains. The release is a pre-release, so the

@@ -6,3 +6,6 @@ allow-indexing-slicing-in-tests = true
 allow-panic-in-tests = true
 allow-print-in-tests = true
 allow-unwrap-in-tests = true
+
+# Product names the documentation uses as words rather than code.
+doc-valid-idents = ["DFlash2", ".."]

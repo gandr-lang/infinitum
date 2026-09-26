@@ -23,7 +23,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-libloading.workspace = true
+infinitum-ninfer.workspace = true
+infinitum-round.workspace = true
 quenchant.workspace = true
 
 [features]
@@ -32,6 +33,12 @@ quenchant.workspace = true
 # remains; enabling a dependency's feature is not a substitute for declaring
 # the condition here.
 anodized = ["quenchant/anodized"]
+# The `generate` command's Engine: ninfer's shared Engine library, linked
+# through the bridge. The build needs `INFINITUM_NINFER_INCLUDE` and
+# `INFINITUM_NINFER_LIB` (see `crates/ninfer/README.md`). Off by default, so a
+# host without ninfer builds and tests the driver; there `generate` plans the
+# round and then reports that the build has no Engine.
+ninfer = ["infinitum-ninfer/engine"]
 
 [lints]
 workspace = true
