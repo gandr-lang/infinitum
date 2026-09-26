@@ -4,6 +4,10 @@ All notable changes to infinitum are documented here.
 
 ## Unreleased
 
+### Unreleased Features
+
+- _(engine)_ Enforce unsafe documentation (#6)
+
 ### Unreleased Bug Fixes
 
 - _(repo)_ Generate the changelog as the squash will land it (#2)

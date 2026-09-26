@@ -2,6 +2,16 @@
 
 lockfile_version = 2
 
+[[tools."cargo:cargo-dylint"]]
+version = "6.0.4"
+backend = "cargo:cargo-dylint"
+specifiers = ["6.0.4"]
+
+[[tools."cargo:dylint-link"]]
+version = "6.0.4"
+backend = "cargo:dylint-link"
+specifiers = ["6.0.4"]
+
 [[tools."cargo:silvanshade/aifix"]]
 version = "rev:acefe2f51f855b33bb7d12122f8af68a302edf0c"
 backend = "cargo:silvanshade/aifix"

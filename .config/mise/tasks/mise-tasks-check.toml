@@ -38,6 +38,13 @@ export RUSTDOCFLAGS
 cargo doc --workspace --no-deps --document-private-items
 """
 
+# Dylint builds the pinned Git plugin and checks every local target. Disable
+# incremental compilation: skipped HIR units can evade a compiler lint pass.
+["check:dylint"]
+description = "Enforce quenchant compiler policy over the workspace"
+env.CARGO_INCREMENTAL = "0"
+run = "cargo dylint --lib quenchant_dylints --no-deps -- --locked --workspace --all-targets"
+
 # The lockfile is two parts: `mise.lock` and, for every npm-backed tool, a
 # sidecar tree under `.mise/locks` whose bytes `mise.lock` records by digest.
 # Nothing else here reads that pairing, so a sidecar regenerated without a

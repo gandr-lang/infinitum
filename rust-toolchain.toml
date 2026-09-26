@@ -1,16 +1,11 @@
 #:tombi toml-version = "v1.0.0"
-# One toolchain for the whole workspace. A Dylint library and its driver link
-# rustc's internal libraries, whether the library is built locally or loaded
-# from Git. Stable-facing crates use this compiler too; a stable release build
-# remains the check that no nightly-only implementation leaked into them.
-# Producers move the nightly and local clippy_utils tag together with
-# `mise run toolchain:bump <stable>`. Git-library consumers take the compiler
-# and metadata revision together with `toolchain:bump --workflow-rev <commit>`.
-# rust-clippy's rust-<stable> release tag names, in its own rust-toolchain.toml,
-# the nightly that tagged clippy_utils was built against. The task writes both
-# pins from that one file and prints the driver-rebuild command a bump owes.
+# One nightly serves both ordinary crates and quenchant's external Dylint
+# plugin. The plugin driver links rustc internals, so rustc-dev and llvm-tools
+# travel with the compiler pin; clippy and rustfmt supply their own gates.
+# This channel matches the quenchant revision in Cargo.toml. A compiler bump
+# must repin both together and invalidate the built driver and library.
 
 [toolchain]
 channel = "nightly-2026-06-25"
-components = ["clippy", "rustfmt"]
+components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
 profile = "minimal"
