@@ -367,6 +367,62 @@ mod tests
         );
     }
 
+    /// A KV capacity below the context ceiling is refused before the round is
+    /// planned; one equal to it passes on to the plan's refusal.
+    #[test]
+    fn serve_refuses_a_kv_capacity_below_the_context()
+    {
+        let serve = |capacity: &str| {
+            let cli = <Cli as clap::Parser>::try_parse_from([
+                "infinitum",
+                "serve",
+                "--artifact",
+                "model.ninfer",
+                "--max-context",
+                "256",
+                "--kv-capacity",
+                capacity,
+                "--draft-width",
+                "16",
+            ])
+            .unwrap();
+            return run(cli, &mut Vec::new());
+        };
+        assert!(
+            matches!(
+                serve("256"),
+                Err(DriverFailure::Serve(ServeFailure::Plan(_)))
+            ),
+            "an equal capacity reaches the plan's refusal, not the capacity check"
+        );
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "infinitum",
+            "serve",
+            "--artifact",
+            "model.ninfer",
+            "--max-context",
+            "256",
+            "--kv-capacity",
+            "255",
+            "--draft-width",
+            "16",
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let failed = run(cli, &mut out);
+        assert!(
+            matches!(
+                failed,
+                Err(DriverFailure::Serve(ServeFailure::KvCapacity(_)))
+            ),
+            "a capacity one token short is refused: {failed:?}"
+        );
+        assert!(
+            out.is_empty(),
+            "nothing is written before the server is ready"
+        );
+    }
+
     /// Each serving limit refuses zero before anything runs, and the body cap
     /// refuses a MiB count whose bytes overflow `usize`.
     #[test]

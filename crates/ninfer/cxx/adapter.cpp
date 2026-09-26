@@ -310,6 +310,20 @@ std::optional<::ninfer::ReasoningEffort> to_effort(EffortLevel value) noexcept {
     }
 }
 
+/// Read a KV storage.
+///
+/// # Specification
+/// trivial.
+::ninfer::KvCacheStorage to_storage(KvStorage storage) noexcept {
+    switch (storage) {
+    case KvStorage::Int8: return ::ninfer::KvCacheStorage::Int8Group64;
+    case KvStorage::Fp8: return ::ninfer::KvCacheStorage::Fp8E4M3Row256;
+    case KvStorage::Nvfp4: return ::ninfer::KvCacheStorage::Nvfp4Group16;
+    case KvStorage::Fp8KeyNvfp4Value: return ::ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
+    default: return ::ninfer::KvCacheStorage::BFloat16;
+    }
+}
+
 /// Read a turn's role.
 ///
 /// # Specification
@@ -437,7 +451,11 @@ std::unique_ptr<Session> open_session(const EngineConfig& config, Outcome& outco
         }
         options.device        = config.device;
         options.max_context   = config.max_context;
-        options.kv_capacity   = ::ninfer::KvCapacityPolicy::explicit_capacity(config.max_context);
+        options.kv_capacity   = config.kv_sizing == KvSizing::Automatic
+                                    ? ::ninfer::KvCapacityPolicy::automatic()
+                                    : ::ninfer::KvCapacityPolicy::explicit_capacity(config.kv_capacity);
+        options.kv_cache      = to_storage(config.kv_storage);
+        options.prefill_chunk = config.prefill_chunk;
         options.pending_timeout_ms        = config.pending_timeout_ms;
         options.use_cuda_graph            = config.cuda_graph == CudaGraph::On;
         options.speculative.backend       = ::ninfer::SpeculativeBackend::DFlash2;

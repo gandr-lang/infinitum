@@ -1,5 +1,6 @@
 //! How an Engine is opened: the artifact, the device, the context ceiling,
-//! the pending timeout, CUDA graph capture, and the chat template.
+//! the KV cache's capacity and storage, the prefill chunk, the pending
+//! timeout, CUDA graph capture, and the chat template.
 
 /// The logical ceiling of one request in tokens, prompt and generation
 /// together. The Engine also sizes its KV cache from it, so a small ceiling
@@ -47,6 +48,262 @@ impl core::str::FromStr for ContextLimit
     {
         return text.parse::<core::num::NonZeroU32>().map(Self);
     }
+}
+
+/// How many tokens the Engine's Main KV cache holds, shared by every lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvCapacity
+{
+    /// This many tokens, at least the context ceiling.
+    Tokens(core::num::NonZeroU32),
+    /// As many as device memory holds after weights, runtime and graph
+    /// allowance, less ninfer's sizing headroom.
+    Automatic,
+}
+
+impl core::str::FromStr for KvCapacity
+{
+    type Err = MalformedKvCapacity;
+
+    /// Parse `auto` or a positive decimal token count.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: `auto` is [`KvCapacity::Automatic`]; a positive `u32` is that
+    ///   many tokens.
+    /// - provides: the command-line spelling of a KV capacity, as ninfer's
+    ///   server spells it.
+    /// - fails: on zero, a negative value, anything above `u32::MAX`, or any
+    ///   other text, case included.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`MalformedKvCapacity`]: as stated.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at the zero boundary and over both spellings.
+    /// - witness: `tests::kv_capacity_parses_auto_and_positive_counts`
+    #[inline]
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        if text == "auto" {
+            return Ok(Self::Automatic);
+        }
+        return text
+            .parse::<core::num::NonZeroU32>()
+            .map(Self::Tokens)
+            .map_err(|_malformed| return MalformedKvCapacity);
+    }
+}
+
+/// A KV capacity that is neither `auto` nor a positive token count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedKvCapacity;
+
+impl core::fmt::Display for MalformedKvCapacity
+{
+    /// Render the failure.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result
+    {
+        return f.write_str("KV capacity is `auto` or a positive token count");
+    }
+}
+
+impl core::error::Error for MalformedKvCapacity
+{
+}
+
+/// A KV capacity in tokens below the context ceiling, which one request
+/// could outgrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvBelowContext;
+
+impl core::fmt::Display for KvBelowContext
+{
+    /// Render the failure, in ninfer's words.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result
+    {
+        return f.write_str("--kv-capacity must be at least --max-context");
+    }
+}
+
+impl core::error::Error for KvBelowContext
+{
+}
+
+/// How the KV cache stores keys and values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvStorage
+{
+    /// `bf16`: bfloat16 keys and values.
+    BFloat16,
+    /// `int8`: 8-bit integers in groups of 64.
+    Int8,
+    /// `fp8`: FP8 E4M3 with one scale per 256-element row.
+    Fp8,
+    /// `nvfp4`: NVFP4 in groups of 16, as the served engine stores it.
+    Nvfp4,
+    /// `k8v4`: FP8 keys and NVFP4 values.
+    Fp8KeyNvfp4Value,
+}
+
+impl core::str::FromStr for KvStorage
+{
+    type Err = UnknownKvStorage;
+
+    /// Parse ninfer's spelling of a KV storage.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: `bf16`, `int8`, `fp8`, `nvfp4` and `k8v4` are the storages
+    ///   ninfer's `--kv-dtype` names by them.
+    /// - provides: the command-line spelling of a KV storage.
+    /// - fails: on any other text, case included.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`UnknownKvStorage`]: `text` is none of the five spellings.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 exhaustive over the five spellings and one refusal.
+    /// - witness: `tests::kv_storage_parses_ninfers_five_spellings`
+    #[inline]
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        return match text {
+            | "bf16" => Ok(Self::BFloat16),
+            | "int8" => Ok(Self::Int8),
+            | "fp8" => Ok(Self::Fp8),
+            | "nvfp4" => Ok(Self::Nvfp4),
+            | "k8v4" => Ok(Self::Fp8KeyNvfp4Value),
+            | _ => Err(UnknownKvStorage),
+        };
+    }
+}
+
+/// A KV storage ninfer does not name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownKvStorage;
+
+impl core::fmt::Display for UnknownKvStorage
+{
+    /// Render the failure.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result
+    {
+        return f.write_str("KV storage is `bf16`, `int8`, `fp8`, `nvfp4` or `k8v4`");
+    }
+}
+
+impl core::error::Error for UnknownKvStorage
+{
+}
+
+/// How many prompt tokens one prefill step processes: a positive multiple of
+/// 128.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillChunk(core::num::NonZeroU32);
+
+impl PrefillChunk
+{
+    /// ninfer's default: 1024 tokens.
+    pub const DEFAULT: Self = Self(match core::num::NonZeroU32::new(1024) {
+        | Some(tokens) => tokens,
+        | None => core::num::NonZeroU32::MIN,
+    });
+}
+
+impl From<PrefillChunk> for core::num::NonZeroU32
+{
+    /// Unwrap the chunk's tokens.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn from(chunk: PrefillChunk) -> Self
+    {
+        return chunk.0;
+    }
+}
+
+impl core::str::FromStr for PrefillChunk
+{
+    type Err = MalformedPrefillChunk;
+
+    /// Parse a positive decimal multiple of 128.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the chunk is the parsed value, a positive multiple
+    ///   of 128.
+    /// - provides: the command-line spelling of a prefill chunk, with ninfer's
+    ///   server's range.
+    /// - fails: on zero, a value that is not a multiple of 128, anything above
+    ///   `u32::MAX`, or a non-numeric string.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`MalformedPrefillChunk`]: as stated.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at zero and either side of 128.
+    /// - witness: `tests::a_prefill_chunk_is_a_positive_multiple_of_128`
+    #[inline]
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        let tokens = text
+            .parse::<core::num::NonZeroU32>()
+            .map_err(|_malformed| return MalformedPrefillChunk)?;
+        if tokens.get() % 128 != 0 {
+            return Err(MalformedPrefillChunk);
+        }
+        return Ok(Self(tokens));
+    }
+}
+
+/// A prefill chunk that is not a positive multiple of 128.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedPrefillChunk;
+
+impl core::fmt::Display for MalformedPrefillChunk
+{
+    /// Render the failure, in ninfer's words.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result
+    {
+        return f.write_str("--prefill-chunk must be a positive multiple of 128");
+    }
+}
+
+impl core::error::Error for MalformedPrefillChunk
+{
 }
 
 /// How long a request may wait for admission, in milliseconds; past it the
@@ -237,6 +494,12 @@ pub struct EngineOptions
     device: DeviceOrdinal,
     /// The context ceiling.
     context: ContextLimit,
+    /// The Main KV capacity.
+    kv_capacity: KvCapacity,
+    /// The KV storage.
+    kv_storage: KvStorage,
+    /// The prefill chunk.
+    prefill_chunk: PrefillChunk,
     /// The pending timeout.
     pending_timeout: PendingTimeout,
     /// CUDA graph capture.
@@ -265,6 +528,9 @@ impl EngineOptions
             artifact,
             device,
             context,
+            kv_capacity: KvCapacity::Tokens(context.0),
+            kv_storage: KvStorage::BFloat16,
+            prefill_chunk: PrefillChunk::DEFAULT,
             pending_timeout: PendingTimeout::DEFAULT,
             cuda_graph,
             chat_template: ChatTemplate::Artifact,
@@ -298,6 +564,107 @@ impl EngineOptions
     pub const fn pending_timeout(&self) -> PendingTimeout
     {
         return self.pending_timeout;
+    }
+
+    /// The same options with `capacity` sizing the Main KV cache.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the capacity is `capacity`, every other option
+    ///   unchanged.
+    /// - provides: `--kv-capacity`, with ninfer's server's cross-check.
+    /// - fails: when `capacity` is a token count below the context ceiling.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`KvBelowContext`]: as stated.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 either side of the context ceiling, and automatic
+    ///   capacity exempt.
+    /// - witness: `tests::a_kv_capacity_below_the_context_is_refused`
+    #[inline]
+    pub fn with_kv_capacity(
+        self,
+        capacity: KvCapacity,
+    ) -> Result<Self, KvBelowContext>
+    {
+        if let KvCapacity::Tokens(tokens) = capacity
+            && tokens < self.context.0
+        {
+            return Err(KvBelowContext);
+        }
+        return Ok(Self {
+            kv_capacity: capacity,
+            ..self
+        });
+    }
+
+    /// The Main KV capacity; the context ceiling unless set.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn kv_capacity(&self) -> KvCapacity
+    {
+        return self.kv_capacity;
+    }
+
+    /// The same options with `storage` storing the KV cache.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub fn with_kv_storage(
+        self,
+        storage: KvStorage,
+    ) -> Self
+    {
+        return Self {
+            kv_storage: storage,
+            ..self
+        };
+    }
+
+    /// The KV storage; bfloat16 unless set.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn kv_storage(&self) -> KvStorage
+    {
+        return self.kv_storage;
+    }
+
+    /// The same options with `chunk` tokens prefilled per step.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub fn with_prefill_chunk(
+        self,
+        chunk: PrefillChunk,
+    ) -> Self
+    {
+        return Self {
+            prefill_chunk: chunk,
+            ..self
+        };
+    }
+
+    /// The prefill chunk; ninfer's 1024 unless set.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn prefill_chunk(&self) -> PrefillChunk
+    {
+        return self.prefill_chunk;
     }
 
     /// The same options with `template` rendering chat prompts.
@@ -382,8 +749,15 @@ mod tests
     use super::ContextLimit;
     use super::CudaGraph;
     use super::DeviceOrdinal;
+    use super::EngineOptions;
+    use super::KvBelowContext;
+    use super::KvCapacity;
+    use super::KvStorage;
+    use super::MalformedKvCapacity;
     use super::PendingTimeout;
+    use super::PrefillChunk;
     use super::UnknownCudaGraph;
+    use super::UnknownKvStorage;
 
     /// A zero ceiling is refused and one is admitted.
     #[test]
@@ -412,6 +786,104 @@ mod tests
             PendingTimeout::from_str("1").is_ok(),
             "one millisecond is a timeout"
         );
+    }
+
+    /// `auto` and a positive count parse; zero and another spelling do not.
+    #[test]
+    fn kv_capacity_parses_auto_and_positive_counts()
+    {
+        assert_eq!(
+            KvCapacity::from_str("auto"),
+            Ok(KvCapacity::Automatic),
+            "auto"
+        );
+        assert_eq!(
+            KvCapacity::from_str("1"),
+            Ok(KvCapacity::Tokens(core::num::NonZeroU32::MIN)),
+            "one token"
+        );
+        assert_eq!(KvCapacity::from_str("0"), Err(MalformedKvCapacity), "zero");
+        assert_eq!(
+            KvCapacity::from_str("Auto"),
+            Err(MalformedKvCapacity),
+            "case matters"
+        );
+    }
+
+    /// A token capacity below the context is refused; one equal to it, and an
+    /// automatic one, are kept.
+    #[test]
+    fn a_kv_capacity_below_the_context_is_refused()
+    {
+        let options = EngineOptions::new(
+            std::path::PathBuf::from("model.ninfer"),
+            DeviceOrdinal::from_str("0").unwrap(),
+            ContextLimit::from_str("256").unwrap(),
+            CudaGraph::On,
+        );
+        assert_eq!(
+            options.kv_capacity(),
+            KvCapacity::from_str("256").unwrap(),
+            "the capacity defaults to the context"
+        );
+        assert_eq!(
+            options
+                .clone()
+                .with_kv_capacity(KvCapacity::from_str("255").unwrap()),
+            Err(KvBelowContext),
+            "one token short"
+        );
+        let equal = KvCapacity::from_str("256").unwrap();
+        assert_eq!(
+            options
+                .clone()
+                .with_kv_capacity(equal)
+                .map(|kept| return kept.kv_capacity()),
+            Ok(equal),
+            "equal to the context"
+        );
+        assert_eq!(
+            options
+                .with_kv_capacity(KvCapacity::Automatic)
+                .map(|kept| return kept.kv_capacity()),
+            Ok(KvCapacity::Automatic),
+            "automatic is sized by the Engine"
+        );
+    }
+
+    /// ninfer's five spellings parse; another does not.
+    #[test]
+    fn kv_storage_parses_ninfers_five_spellings()
+    {
+        for (text, storage) in [
+            ("bf16", KvStorage::BFloat16),
+            ("int8", KvStorage::Int8),
+            ("fp8", KvStorage::Fp8),
+            ("nvfp4", KvStorage::Nvfp4),
+            ("k8v4", KvStorage::Fp8KeyNvfp4Value),
+        ] {
+            assert_eq!(KvStorage::from_str(text), Ok(storage), "{text}");
+        }
+        assert_eq!(
+            KvStorage::from_str("NVFP4"),
+            Err(UnknownKvStorage),
+            "case matters"
+        );
+    }
+
+    /// 128 and 256 are chunks; zero, 127 and 129 are not.
+    #[test]
+    fn a_prefill_chunk_is_a_positive_multiple_of_128()
+    {
+        for text in ["128", "256"] {
+            assert!(PrefillChunk::from_str(text).is_ok(), "{text} is a chunk");
+        }
+        for text in ["0", "127", "129"] {
+            assert!(
+                PrefillChunk::from_str(text).is_err(),
+                "{text} is not a chunk"
+            );
+        }
     }
 
     /// Minus one names no device; zero does.

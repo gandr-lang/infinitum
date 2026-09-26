@@ -25,8 +25,15 @@ pub use options::ContextLimit;
 pub use options::CudaGraph;
 pub use options::DeviceOrdinal;
 pub use options::EngineOptions;
+pub use options::KvBelowContext;
+pub use options::KvCapacity;
+pub use options::KvStorage;
+pub use options::MalformedKvCapacity;
+pub use options::MalformedPrefillChunk;
 pub use options::PendingTimeout;
+pub use options::PrefillChunk;
 pub use options::UnknownCudaGraph;
+pub use options::UnknownKvStorage;
 pub use plan::DFlash2Plan;
 pub use plan::Ninfer;
 #[cfg(feature = "engine")]

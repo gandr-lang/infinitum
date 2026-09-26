@@ -8,12 +8,18 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use infinitum_ninfer::ChatTemplate;
 use infinitum_ninfer::ContextLimit;
 use infinitum_ninfer::CudaGraph;
 use infinitum_ninfer::DFlash2Plan;
 use infinitum_ninfer::DeviceOrdinal;
+use infinitum_ninfer::EngineOptions;
+use infinitum_ninfer::KvBelowContext;
+use infinitum_ninfer::KvCapacity;
+use infinitum_ninfer::KvStorage;
 use infinitum_ninfer::Ninfer;
 use infinitum_ninfer::PendingTimeout;
+use infinitum_ninfer::PrefillChunk;
 use infinitum_round::Backend as _;
 use infinitum_round::BuildFailure;
 use infinitum_round::DraftWidth;
@@ -35,9 +41,21 @@ pub struct Server
     /// 15.
     #[arg(long, value_name = "TOKENS", default_value = "7")]
     draft_width: DraftWidth,
-    /// The per-request context ceiling in tokens; it also sizes the KV cache.
+    /// The per-request context ceiling in tokens.
     #[arg(long, value_name = "TOKENS", default_value = "8192")]
     max_context: ContextLimit,
+    /// The Main KV capacity shared by every request: a token count at least
+    /// `--max-context`, or `auto` to size it from device memory; absent, the
+    /// context ceiling.
+    #[arg(long, value_name = "TOKENS|auto")]
+    kv_capacity: Option<KvCapacity>,
+    /// How the KV cache stores keys and values: `bf16`, `int8`, `fp8`,
+    /// `nvfp4` or `k8v4`.
+    #[arg(long, value_name = "STORAGE", default_value = "bf16")]
+    kv_dtype: KvStorage,
+    /// Prompt tokens per prefill step, a positive multiple of 128.
+    #[arg(long, value_name = "TOKENS", default_value = "1024")]
+    prefill_chunk: PrefillChunk,
     /// The output limit of a request that names none; the Engine also clamps
     /// it to the context left after the prompt.
     #[arg(long, value_name = "TOKENS", default_value = "8192")]
@@ -173,6 +191,8 @@ pub enum ServeFailure
     Compose(BuildFailure),
     /// ninfer refused the round.
     Plan(Refusal),
+    /// The KV capacity is below the context ceiling.
+    KvCapacity(KvBelowContext),
     /// This build has no ninfer Engine.
     #[cfg(not(feature = "ninfer"))]
     NoEngine(DFlash2Plan),
@@ -202,6 +222,7 @@ impl core::fmt::Display for ServeFailure
                 write!(f, "cannot compose the DFlash2 round: {failure}")
             },
             | Self::Plan(ref refusal) => core::fmt::Display::fmt(refusal, f),
+            | Self::KvCapacity(ref failure) => core::fmt::Display::fmt(failure, f),
             #[cfg(not(feature = "ninfer"))]
             | Self::NoEngine(ref plan) => write!(
                 f,
@@ -252,6 +273,49 @@ fn plan(server: &Server) -> Result<DFlash2Plan, ServeFailure>
     return Ninfer.plan(&graph).map_err(ServeFailure::Plan);
 }
 
+/// Gather the Engine options the flags name.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: on success the options carry the artifact, device, context, KV
+///   capacity (the context ceiling when absent), KV storage, prefill chunk,
+///   pending timeout, CUDA graph choice and chat template the flags name.
+/// - provides: every Engine option `serve` sets, checked before an Engine
+///   opens.
+/// - fails: when `--kv-capacity` is a token count below `--max-context`.
+/// - panics: none.
+///
+/// # Errors
+/// - [`ServeFailure::KvCapacity`]: as stated.
+///
+/// # Adequacy
+/// - hypothesis: L3 on the refusal; the option setters are witnessed in
+///   `infinitum-ninfer`.
+/// - witness: `crate::tests::serve_refuses_a_kv_capacity_below_the_context`
+fn engine_options(server: &Server) -> Result<EngineOptions, ServeFailure>
+{
+    let template = server
+        .chat_template
+        .clone()
+        .map_or(ChatTemplate::Artifact, ChatTemplate::File);
+    let options = EngineOptions::new(
+        server.artifact.clone(),
+        server.device,
+        server.max_context,
+        server.cuda_graph,
+    )
+    .with_chat_template(template)
+    .with_pending_timeout(server.pending_timeout_ms)
+    .with_kv_storage(server.kv_dtype)
+    .with_prefill_chunk(server.prefill_chunk);
+    return match server.kv_capacity {
+        | Some(capacity) => options
+            .with_kv_capacity(capacity)
+            .map_err(ServeFailure::KvCapacity),
+        | None => Ok(options),
+    };
+}
+
 /// Plan, open, warm up and serve.
 ///
 /// # Specification
@@ -259,9 +323,9 @@ fn plan(server: &Server) -> Result<DFlash2Plan, ServeFailure>
 /// - ensures: nothing returns while the server runs; before it serves, `out`
 ///   holds one `listening on <host>:<port> as <model id>` line.
 /// - provides: the driver's server.
-/// - fails: with the first failure, in the order plan, open, warm up, bind,
-///   serve; without the `ninfer` feature, with [`ServeFailure::NoEngine`] after
-///   a successful plan.
+/// - fails: with the first failure, in the order options, plan, open, warm up,
+///   bind, serve; without the `ninfer` feature, with [`ServeFailure::NoEngine`]
+///   after a successful plan.
 /// - panics: none.
 ///
 /// # Errors
@@ -279,8 +343,9 @@ pub fn run<Writer>(
 where
     Writer: Write,
 {
+    let options = engine_options(server)?;
     let plan = plan(server)?;
-    return execute(server, plan, out);
+    return execute(server, plan, &options, out);
 }
 
 /// Without an Engine, a planned server goes no further.
@@ -298,6 +363,7 @@ where
 const fn execute<Writer>(
     _server: &Server,
     plan: DFlash2Plan,
+    _options: &EngineOptions,
     _out: &mut Writer,
 ) -> Result<(), ServeFailure>
 where
@@ -324,6 +390,7 @@ where
 fn execute<Writer>(
     server: &Server,
     plan: DFlash2Plan,
+    options: &EngineOptions,
     out: &mut Writer,
 ) -> Result<(), ServeFailure>
 where
@@ -332,22 +399,8 @@ where
     use alloc::sync::Arc;
 
     use infinitum_chat::ChatBackend as _;
-    use infinitum_ninfer::ChatTemplate;
 
-    let template = server
-        .chat_template
-        .clone()
-        .map_or(ChatTemplate::Artifact, ChatTemplate::File);
-    let options = infinitum_ninfer::EngineOptions::new(
-        server.artifact.clone(),
-        server.device,
-        server.max_context,
-        server.cuda_graph,
-    )
-    .with_chat_template(template)
-    .with_pending_timeout(server.pending_timeout_ms);
-    let engine =
-        infinitum_ninfer::ChatEngine::open(&options, plan).map_err(ServeFailure::Engine)?;
+    let engine = infinitum_ninfer::ChatEngine::open(options, plan).map_err(ServeFailure::Engine)?;
     infinitum_serve::warm_up(&engine).map_err(ServeFailure::WarmUp)?;
     let model = server
         .model_id
