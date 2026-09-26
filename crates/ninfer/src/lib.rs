@@ -21,6 +21,8 @@ mod text;
 #[cfg(feature = "engine")]
 pub use chat::ChatEngine;
 pub use options::ChatTemplate;
+pub use options::Concurrency;
+pub use options::ConcurrencyOutOfRange;
 pub use options::ContextLimit;
 pub use options::CudaGraph;
 pub use options::DeviceOrdinal;

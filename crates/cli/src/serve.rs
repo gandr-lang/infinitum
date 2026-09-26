@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use infinitum_ninfer::ChatTemplate;
+use infinitum_ninfer::Concurrency;
 use infinitum_ninfer::ContextLimit;
 use infinitum_ninfer::CudaGraph;
 use infinitum_ninfer::DFlash2Plan;
@@ -56,6 +57,10 @@ pub struct Server
     /// Prompt tokens per prefill step, a positive multiple of 128.
     #[arg(long, value_name = "TOKENS", default_value = "1024")]
     prefill_chunk: PrefillChunk,
+    /// Requests the Engine runs at once, one to eight; more wait for a lane
+    /// up to `--pending-timeout-ms`.
+    #[arg(long, value_name = "LANES", default_value = "1")]
+    max_concurrency: Concurrency,
     /// The output limit of a request that names none; the Engine also clamps
     /// it to the context left after the prompt.
     #[arg(long, value_name = "TOKENS", default_value = "8192")]
@@ -279,7 +284,8 @@ fn plan(server: &Server) -> Result<DFlash2Plan, ServeFailure>
 /// - requires: nothing.
 /// - ensures: on success the options carry the artifact, device, context, KV
 ///   capacity (the context ceiling when absent), KV storage, prefill chunk,
-///   pending timeout, CUDA graph choice and chat template the flags name.
+///   concurrency, pending timeout, CUDA graph choice and chat template the
+///   flags name.
 /// - provides: every Engine option `serve` sets, checked before an Engine
 ///   opens.
 /// - fails: when `--kv-capacity` is a token count below `--max-context`.
@@ -307,7 +313,8 @@ fn engine_options(server: &Server) -> Result<EngineOptions, ServeFailure>
     .with_chat_template(template)
     .with_pending_timeout(server.pending_timeout_ms)
     .with_kv_storage(server.kv_dtype)
-    .with_prefill_chunk(server.prefill_chunk);
+    .with_prefill_chunk(server.prefill_chunk)
+    .with_concurrency(server.max_concurrency);
     return match server.kv_capacity {
         | Some(capacity) => options
             .with_kv_capacity(capacity)

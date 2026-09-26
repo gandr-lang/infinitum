@@ -142,6 +142,8 @@ pub mod ffi
         kv_storage: KvStorage,
         /// Prompt tokens per prefill step.
         prefill_chunk: u32,
+        /// Requests the Engine runs at once.
+        max_concurrency: u32,
         /// How long a request may wait for admission, in milliseconds.
         pending_timeout_ms: u32,
         /// DFlash2's draft width `K`.
