@@ -165,7 +165,7 @@ jobs:
     steps:
       - id: resolve
         name: resolve the image reference
-        run: echo "ref=${INFINITUM_CI_IMAGE:+ghcr.io/gandr-lang/infinitum-ci:${INFINITUM_CI_IMAGE}}" >> "$GITHUB_OUTPUT"
+        run: echo "ref=${INFINITUM_CI_IMAGE:+ghcr.io/silvanshade-org/infinitum-ci:${INFINITUM_CI_IMAGE}}" >> "$GITHUB_OUTPUT"
 
   # `push` is in the condition, not just `merge_group`, because the push-to-main
   # run is the cache warmer: caches are readable only from the current branch,
@@ -298,6 +298,11 @@ jobs:
       CI_FETCH_DEPTH: "0"
     steps:
       - *git-checkout
+      # The checkout is owned by the runner's user, not the container's, and
+      # actions/checkout trusts it only for its own step. The changelog
+      # formatter reads history, so git must trust the workspace here.
+      - name: trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       # The pinned toolchain for treefmt's rustfmt pass; restore-only, because
       # the heavy lanes are the cache writers.
       - *setup-rust

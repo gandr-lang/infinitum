@@ -8,6 +8,10 @@ All notable changes to infinitum are documented here.
 
 - _(repo)_ Generate the changelog as the squash will land it (#2)
 
+### Unreleased Continuous Integration
+
+- _(repo)_ Publish and pull the CI image under silvanshade-org (#5)
+
 ## 0.0.0 - 2026-09-22
 
 ### 0.0.0 Features

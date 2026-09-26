@@ -13,7 +13,7 @@ edition = "2024"
 # nothing about this floor; `cargo +1.97.1 check --locked --workspace` is what
 # holds it honest.
 rust-version = "1.97"
-repository = "https://github.com/gandr-lang/infinitum"
+repository = "https://github.com/silvanshade-org/infinitum"
 license = "Apache-2.0 WITH LLVM-exception"
 
 # Command-line argument parser; the driver takes the `derive` face.

@@ -1,6 +1,6 @@
 # infinitum-changelog
 
-Workflow tooling for [infinitum](https://github.com/gandr-lang/infinitum): generates `CHANGELOG.md` as the default branch will hold it.
+Workflow tooling for [infinitum](https://github.com/silvanshade-org/infinitum): generates `CHANGELOG.md` as the default branch will hold it.
 
 A pull request lands as one squash commit whose subject is `<pull request title> (#<number>)`, so a changelog generated from a branch's own commits is never the changelog `main` generates after the merge. This binary removes that difference at the source.
 
