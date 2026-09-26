@@ -6,19 +6,27 @@
 //! server, and a body one refuses the other refuses with the same parameter
 //! and code.
 
+use infinitum_chat::Automatic;
+use infinitum_chat::CacheBoundary;
+use infinitum_chat::CacheMarker;
 use infinitum_chat::ChatRequest;
+use infinitum_chat::Count;
 use infinitum_chat::Delivery;
 use infinitum_chat::Effort;
 use infinitum_chat::Generation;
+use infinitum_chat::InstructionBytes;
+use infinitum_chat::Marked;
 use infinitum_chat::Message;
 use infinitum_chat::PrefixReuse;
 use infinitum_chat::Prompt;
+use infinitum_chat::PromptCache;
 use infinitum_chat::Role;
 use infinitum_chat::Sampling;
 use infinitum_chat::Seed;
 use infinitum_chat::Setting;
 use infinitum_chat::SpecialTokens;
 use infinitum_chat::StopScope;
+use infinitum_chat::StructuralPrefixes;
 use infinitum_chat::Switch;
 use infinitum_chat::ThinkingBudget;
 use infinitum_chat::ToolCall;
@@ -608,11 +616,13 @@ fn refuse_unsupported(body: &Object) -> Result<(), ApiError>
     return Ok(());
 }
 
-/// Validate the prompt-cache hints; their markers are not yet applied.
+/// Validate the prompt-cache hints and read the automatic-write policy.
 ///
 /// # Specification
 /// - requires: nothing.
-/// - ensures: nothing on success.
+/// - ensures: on success, the policy `prompt_cache_options` names: absent, the
+///   default automatic write; `mode` `explicit`, none; otherwise the requested
+///   automatic write.
 /// - provides: ninfer's checks on `prompt_cache_key`, `safety_identifier`,
 ///   `user`, `prompt_cache_retention` and `prompt_cache_options`.
 /// - fails: on a malformed hint.
@@ -620,7 +630,7 @@ fn refuse_unsupported(body: &Object) -> Result<(), ApiError>
 ///
 /// # Errors
 /// - [`ApiError`]: naming the hint.
-fn check_cache_hints(body: &Object) -> Result<(), ApiError>
+fn cache_policy(body: &Object) -> Result<AutomaticWrite, ApiError>
 {
     for (key, limit) in [
         ("prompt_cache_key", 64_usize),
@@ -691,41 +701,301 @@ fn check_cache_hints(body: &Object) -> Result<(), ApiError>
                 Code::NONE,
             ));
         }
+        if let Maybe::Present(mode) = field(map, Key("mode"))
+            && mode.as_str() == Some("explicit")
+        {
+            return Ok(AutomaticWrite::Disabled);
+        }
+        return Ok(AutomaticWrite::Requested);
     }
-    return Ok(());
+    return Ok(AutomaticWrite::Default);
 }
 
-/// A content part's cache breakpoint, validated and not yet applied.
+/// Which automatic cache write a body asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticWrite
+{
+    /// None: only explicit breakpoints write.
+    Disabled,
+    /// The protocol's default, absent `prompt_cache_options`.
+    Default,
+    /// The one `prompt_cache_options` asks for.
+    Requested,
+}
+
+/// A translated turn with the explicit breakpoint after each of its parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Turn
+{
+    /// The turn.
+    message: Message,
+    /// Whether each part, in order, carries an explicit breakpoint.
+    marks: Vec<Marked>,
+}
+
+/// A cache slot as ninfer's policy sees it: empty, or a boundary with its
+/// evidence.
+type Slot = Option<(Marked, Automatic)>;
+
+/// The most explicit cache writes one request keeps, ninfer's
+/// `kMaximumExplicitPromptCacheMarkers`.
+const EXPLICIT_WRITES: usize = 4;
+
+/// The explicit cache writes kept beside an automatic write that needs its
+/// own slot: one fewer than [`EXPLICIT_WRITES`].
+const EXPLICIT_WRITES_BESIDE_AUTOMATIC: usize = 3;
+
+/// A count of messages, parts, tools or bytes, before it is narrowed to a
+/// marker's `u32`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tally(usize);
+
+impl Tally
+{
+    /// Narrow the count to the marker's `u32`, as ninfer's lowering does.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success, the count unchanged.
+    /// - provides: every marker count.
+    /// - fails: when the count exceeds `u32::MAX`.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`ApiError`]: ninfer's overflow message, naming `messages`.
+    fn narrow(self) -> Result<Count, ApiError>
+    {
+        return u32::try_from(self.0).map(Count).map_err(|_overflow| {
+            return ApiError::invalid(
+                String::from("conversation cache boundary exceeds uint32"),
+                Param("messages"),
+                Code::NONE,
+            );
+        });
+    }
+}
+
+/// The prompt's cache markers, as ninfer's server derives them for a Chat
+/// Completions body.
+///
+/// # Specification
+/// - requires: `tools` are the tool definitions the prompt offers.
+/// - ensures: the automatic write targets the last turn, from the end, with
+///   tool calls (its boundary) or parts (its last part), else the last offered
+///   tool; it is enabled unless `policy` is [`AutomaticWrite::Disabled`] or
+///   there is no target. Of the explicit breakpoints only the last four are
+///   kept, three when an enabled automatic write needs a slot of its own. The
+///   automatic write joins an explicit breakpoint at its target or stands
+///   alone. Markers are listed per turn, parts before the turn's own boundary,
+///   then per tool; a part of a leading system or developer turn is placed by
+///   its cumulative text bytes, any other part by its turn's one-based position
+///   and its part count. Structural shared prefixes are withheld, since the
+///   protocol has its own write policy.
+/// - provides: the Chat Completions cache hints.
+/// - fails: when a count or byte offset exceeds `u32`.
+/// - panics: none.
+///
+/// # Errors
+/// - [`ApiError`]: ninfer's overflow message, naming `messages`.
+///
+/// # Adequacy
+/// - hypothesis: L3 — the default write on the last part, an assistant turn's
+///   tool calls taking the boundary, the explicit-mode switch-off, the
+///   four-write cap with and without a merged target, and leading-instruction
+///   byte placement.
+/// - witness: `tests::cache_markers_follow_ninfers_policy`
+fn prompt_cache(
+    turns: &[Turn],
+    tools: &[String],
+    policy: AutomaticWrite,
+) -> Result<PromptCache, ApiError>
+{
+    let mut slots: Vec<TurnSlots> = turns
+        .iter()
+        .map(|turn| {
+            let parts = turn
+                .marks
+                .iter()
+                .map(|mark| {
+                    return match *mark {
+                        | Marked::Explicit => Some((Marked::Explicit, Automatic::Not)),
+                        | Marked::Unmarked => None,
+                    };
+                })
+                .collect();
+            return TurnSlots {
+                parts,
+                boundary: None,
+            };
+        })
+        .collect();
+    let mut last_tool: Slot = None;
+    let target = turns
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, turn)| {
+            if !turn.message.tool_calls.is_empty() {
+                return Some(Target::Turn(index));
+            }
+            return turn
+                .message
+                .parts
+                .len()
+                .checked_sub(1)
+                .map(|last| return Target::Part(index, last));
+        })
+        .or_else(|| return (!tools.is_empty()).then_some(Target::Tool));
+    let automatic = match policy {
+        | AutomaticWrite::Disabled => Automatic::Not,
+        | AutomaticWrite::Default => Automatic::Default,
+        | AutomaticWrite::Requested => Automatic::Requested,
+    };
+    let enabled = automatic != Automatic::Not && target.is_some();
+    let merges = enabled
+        && match target {
+            | Some(Target::Part(turn, part)) => slots
+                .get(turn)
+                .and_then(|turn| return turn.parts.get(part))
+                .is_some_and(Option::is_some),
+            | Some(Target::Turn(_) | Target::Tool) | None => false,
+        };
+    let keep = if !enabled || merges {
+        EXPLICIT_WRITES
+    }
+    else {
+        EXPLICIT_WRITES_BESIDE_AUTOMATIC
+    };
+    let explicit = slots
+        .iter()
+        .flat_map(|turn| return turn.parts.iter())
+        .filter(|slot| return slot.is_some())
+        .count();
+    for slot in slots
+        .iter_mut()
+        .flat_map(|turn| return turn.parts.iter_mut())
+        .filter(|slot| return slot.is_some())
+        .take(explicit.saturating_sub(keep))
+    {
+        *slot = None;
+    }
+    if enabled {
+        let slot = match target {
+            | Some(Target::Part(turn, part)) => slots
+                .get_mut(turn)
+                .and_then(|turn| return turn.parts.get_mut(part)),
+            | Some(Target::Turn(turn)) => slots.get_mut(turn).map(|turn| return &mut turn.boundary),
+            | Some(Target::Tool) => Some(&mut last_tool),
+            | None => None,
+        };
+        if let Some(slot) = slot {
+            *slot = Some(slot.map_or((Marked::Unmarked, automatic), |(marked, _)| {
+                return (marked, automatic);
+            }));
+        }
+    }
+    let mut markers = Vec::new();
+    for (index, (turn, turn_slots)) in turns.iter().zip(&slots).enumerate() {
+        let leading = index == 0 && matches!(turn.message.role, Role::System | Role::Developer);
+        let message = Tally(index.saturating_add(1)).narrow()?;
+        let mut bytes = 0_usize;
+        for (part, (text, slot)) in turn.message.parts.iter().zip(&turn_slots.parts).enumerate() {
+            bytes = bytes.saturating_add(text.len());
+            if let Some((marked, automatic)) = *slot {
+                let boundary = if leading {
+                    CacheBoundary::LeadingInstruction(InstructionBytes(Tally(bytes).narrow()?.0))
+                }
+                else {
+                    CacheBoundary::MessagePart {
+                        message,
+                        parts: Tally(part.saturating_add(1)).narrow()?,
+                    }
+                };
+                markers.push(CacheMarker {
+                    boundary,
+                    marked,
+                    automatic,
+                });
+            }
+        }
+        if let Some((marked, automatic)) = turn_slots.boundary {
+            markers.push(CacheMarker {
+                boundary: CacheBoundary::Message(message),
+                marked,
+                automatic,
+            });
+        }
+    }
+    if let Some((marked, automatic)) = last_tool {
+        markers.push(CacheMarker {
+            boundary: CacheBoundary::Tool(Tally(tools.len()).narrow()?),
+            marked,
+            automatic,
+        });
+    }
+    return Ok(PromptCache {
+        markers,
+        structural: StructuralPrefixes::Withheld,
+    });
+}
+
+/// One turn's cache slots: one per part, and the turn's own boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnSlots
+{
+    /// After each part, in order.
+    parts: Vec<Slot>,
+    /// After the turn.
+    boundary: Slot,
+}
+
+/// Where a body's automatic cache write lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target
+{
+    /// After this part of this turn.
+    Part(usize, usize),
+    /// After this turn, whose tool calls end it.
+    Turn(usize),
+    /// After the last offered tool.
+    Tool,
+}
+
+/// A content part's cache breakpoint.
 ///
 /// # Specification
 /// - requires: nothing.
-/// - ensures: nothing on success.
-/// - provides: ninfer's check on `prompt_cache_breakpoint`.
+/// - ensures: on success, whether the part carries an explicit breakpoint.
+/// - provides: ninfer's check and reading of `prompt_cache_breakpoint`.
 /// - fails: when present and not `{"mode":"explicit"}`.
 /// - panics: none.
 ///
 /// # Errors
 /// - [`ApiError`]: code `invalid_cache_breakpoint`.
-fn check_breakpoint(part: &Object) -> Result<(), ApiError>
+fn breakpoint(part: &Object) -> Result<Marked, ApiError>
 {
-    if let Maybe::Present(breakpoint) = field(part, Key("prompt_cache_breakpoint"))
-        && breakpoint.get("mode").and_then(Value::as_str) != Some("explicit")
-    {
+    let Maybe::Present(breakpoint) = field(part, Key("prompt_cache_breakpoint"))
+    else {
+        return Ok(Marked::Unmarked);
+    };
+    if breakpoint.get("mode").and_then(Value::as_str) != Some("explicit") {
         return Err(ApiError::invalid(
             String::from("prompt_cache_breakpoint must be {mode:'explicit'}"),
             Param("messages"),
             Code("invalid_cache_breakpoint"),
         ));
     }
-    return Ok(());
+    return Ok(Marked::Explicit);
 }
 
-/// A message's content as text parts.
+/// A message's content as text parts, each with its breakpoint.
 ///
 /// # Specification
 /// - requires: nothing.
-/// - ensures: a string is one part; an array yields its `text` parts and, on
-///   assistant turns, its `refusal` parts, in order.
+/// - ensures: a string is one unmarked part; an array yields its `text` parts
+///   and, on assistant turns, its `refusal` parts, in order, each marked as its
+///   `prompt_cache_breakpoint` says.
 /// - provides: every turn's parts.
 /// - fails: on a malformed part, a refusal off an assistant turn, or a media
 ///   part, which this server refuses because vision is disabled.
@@ -737,10 +1007,10 @@ fn content_parts(
     content: &Value,
     role: Role,
     index: Position,
-) -> Result<Vec<String>, ApiError>
+) -> Result<Vec<(String, Marked)>, ApiError>
 {
     if let Value::String(ref text) = *content {
-        return Ok(vec![text.clone()]);
+        return Ok(vec![(text.clone(), Marked::Unmarked)]);
     }
     let Some(parts) = content.as_array()
     else {
@@ -810,8 +1080,8 @@ fn content_parts(
                 ));
             },
         };
-        check_breakpoint(object)?;
-        texts.push(String::from(text));
+        let marked = breakpoint(object)?;
+        texts.push((String::from(text), marked));
     }
     return Ok(texts);
 }
@@ -1029,7 +1299,8 @@ fn assistant_reasoning(
 /// # Specification
 /// - requires: nothing.
 /// - ensures: the turn carries its role, parts, and the reasoning, tool calls
-///   or tool-call id its role admits.
+///   or tool-call id its role admits, with each part's explicit breakpoint
+///   beside it.
 /// - provides: the conversation.
 /// - fails: on any check ninfer's server makes on a message.
 /// - panics: none.
@@ -1039,7 +1310,7 @@ fn assistant_reasoning(
 fn message(
     value: &Value,
     index: Position,
-) -> Result<Message, ApiError>
+) -> Result<Turn, ApiError>
 {
     let (Some(item), Some(role_name)) =
         (value.as_object(), value.get("role").and_then(Value::as_str))
@@ -1131,8 +1402,7 @@ fn message(
                 Code::NONE,
             ));
         };
-        turn.parts = content_parts(content, role, index)?;
-        return Ok(turn);
+        return Ok(with_parts(turn, content_parts(content, role, index)?));
     }
     require_empty(
         item,
@@ -1149,9 +1419,10 @@ fn message(
         }
         turn.tool_calls = assistant_calls(item, index)?;
         turn.reasoning = assistant_reasoning(item, index)?;
-        if let Maybe::Present(content) = field(item, Key("content")) {
-            turn.parts = content_parts(content, role, index)?;
-        }
+        let mut parts = match field(item, Key("content")) {
+            | Maybe::Present(content) => content_parts(content, role, index)?,
+            | Maybe::Absent(_) => Vec::new(),
+        };
         if let Maybe::Present(refusal) = field(item, Key("refusal")) {
             let Some(text) = refusal.as_str()
             else {
@@ -1162,10 +1433,10 @@ fn message(
                 ));
             };
             if !text.is_empty() {
-                turn.parts.push(String::from(text));
+                parts.push((String::from(text), Marked::Unmarked));
             }
         }
-        return Ok(turn);
+        return Ok(with_parts(turn, parts));
     }
     if let Maybe::Present(calls) = field(item, Key("tool_calls"))
         && calls.as_array().is_none_or(|list| return !list.is_empty())
@@ -1184,8 +1455,21 @@ fn message(
             Code::NONE,
         ));
     };
-    turn.parts = content_parts(content, role, index)?;
-    return Ok(turn);
+    return Ok(with_parts(turn, content_parts(content, role, index)?));
+}
+
+/// A turn given its parts, with their breakpoints kept beside it.
+///
+/// # Specification
+/// trivial.
+fn with_parts(
+    mut message: Message,
+    parts: Vec<(String, Marked)>,
+) -> Turn
+{
+    let (texts, marks) = parts.into_iter().unzip();
+    message.parts = texts;
+    return Turn { message, marks };
 }
 
 /// One declared tool: its name and rendered definition.
@@ -1912,7 +2196,7 @@ pub fn chat_request(
             ));
         },
     };
-    check_cache_hints(body)?;
+    let policy = cache_policy(body)?;
     let mut declared = tools(body)?;
     let tool_use = tool_choice(body, &mut declared)?;
     if boolean(body, Key("parallel_tool_calls"))? == Flag::False
@@ -1941,10 +2225,9 @@ pub fn chat_request(
             Code::NONE,
         ));
     };
-    let mut messages = Vec::with_capacity(list.len());
+    let mut turns = Vec::with_capacity(list.len());
     for (index, value) in list.iter().enumerate() {
-        let turn = message(value, Position(index))?;
-        messages.push(turn);
+        turns.push(message(value, Position(index))?);
     }
     let (stops, stop_scope) = stops(body)?;
     let post_thinking = match field(body, Key("post_thinking")) {
@@ -2011,16 +2294,16 @@ pub fn chat_request(
     let output_tokens = output_tokens(body, defaults)?;
     let (thinking, preserve_thinking, effort, template_arguments) = template_choices(body)?;
     let offered = tool_use == ToolUse::Auto && !declared.is_empty();
-    let tool_history = messages
-        .iter()
-        .any(|turn| return turn.role == Role::Tool || !turn.tool_calls.is_empty());
+    let tool_history = turns.iter().any(|turn| {
+        return turn.message.role == Role::Tool || !turn.message.tool_calls.is_empty();
+    });
     let special_tokens = if offered || tool_history {
         SpecialTokens::Preserved
     }
     else {
         SpecialTokens::Trimmed
     };
-    let tools = if offered {
+    let tools: Vec<String> = if offered {
         declared
             .into_iter()
             .map(|tool| return tool.definition)
@@ -2029,6 +2312,8 @@ pub fn chat_request(
     else {
         Vec::new()
     };
+    let cache = prompt_cache(&turns, &tools, policy)?;
+    let messages = turns.into_iter().map(|turn| return turn.message).collect();
     return Ok(ParsedChat {
         model,
         delivery,
@@ -2041,6 +2326,7 @@ pub fn chat_request(
                 thinking,
                 preserve_thinking,
                 effort,
+                cache,
             },
             generation: Generation {
                 output_tokens,
@@ -2064,12 +2350,19 @@ pub fn chat_request(
 #[cfg(test)]
 mod tests
 {
+    use infinitum_chat::Automatic;
+    use infinitum_chat::CacheBoundary;
+    use infinitum_chat::CacheMarker;
+    use infinitum_chat::Count;
     use infinitum_chat::Delivery;
     use infinitum_chat::Effort;
+    use infinitum_chat::InstructionBytes;
+    use infinitum_chat::Marked;
     use infinitum_chat::Role;
     use infinitum_chat::Setting;
     use infinitum_chat::SpecialTokens;
     use infinitum_chat::StopScope;
+    use infinitum_chat::StructuralPrefixes;
     use infinitum_chat::Switch;
     use infinitum_round::Maybe;
     use infinitum_round::TokenCount;
@@ -2091,6 +2384,131 @@ mod tests
     const DEFAULTS: Defaults = Defaults {
         output_tokens: TokenCount::ZERO,
     };
+
+    /// The cache markers ninfer's server derives for `messages`, with
+    /// `options` as `prompt_cache_options` when present.
+    ///
+    /// # Specification
+    /// - requires: the body translates.
+    /// - ensures: the translated prompt's markers, after checking that
+    ///   structural prefixes are withheld.
+    /// - provides: the cache-policy cases' round trip.
+    fn markers(
+        messages: &serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> Vec<(CacheBoundary, Marked, Automatic)>
+    {
+        let mut body = json!({"model": "m", "messages": messages});
+        if let Some(options) = options {
+            body["prompt_cache_options"] = options;
+        }
+        let cache = chat_request(&body, DEFAULTS, FreshSeed(0))
+            .unwrap()
+            .request
+            .prompt
+            .cache;
+        assert_eq!(
+            cache.structural,
+            StructuralPrefixes::Withheld,
+            "Chat Completions has its own write policy"
+        );
+        return cache
+            .markers
+            .into_iter()
+            .map(
+                |CacheMarker {
+                     boundary,
+                     marked,
+                     automatic,
+                 }| return (boundary, marked, automatic),
+            )
+            .collect();
+    }
+
+    #[test]
+    fn cache_markers_follow_ninfers_policy()
+    {
+        let marked = |text: &str| {
+            return json!({"type": "text", "text": text, "prompt_cache_breakpoint": {"mode": "explicit"}});
+        };
+        let part = |message: u32, parts: u32| {
+            return CacheBoundary::MessagePart {
+                message: Count(message),
+                parts: Count(parts),
+            };
+        };
+        let plain = json!([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]);
+        assert_eq!(
+            markers(&plain, None),
+            vec![(part(2, 1), Marked::Unmarked, Automatic::Default)],
+            "the default write lands after the last part"
+        );
+        assert_eq!(
+            markers(&plain, Some(json!({"mode": "implicit"}))),
+            vec![(part(2, 1), Marked::Unmarked, Automatic::Requested)],
+            "prompt_cache_options requests the write"
+        );
+        assert!(
+            markers(&plain, Some(json!({"mode": "explicit"}))).is_empty(),
+            "explicit mode leaves only breakpoints"
+        );
+        let leading = json!([
+            {"role": "system", "content": [{"type": "text", "text": "ab"}, marked("cde")]},
+            {"role": "user", "content": "u"}
+        ]);
+        assert_eq!(
+            markers(&leading, None),
+            vec![
+                (
+                    CacheBoundary::LeadingInstruction(InstructionBytes(5)),
+                    Marked::Explicit,
+                    Automatic::Not
+                ),
+                (part(2, 1), Marked::Unmarked, Automatic::Default),
+            ],
+            "a leading instruction's breakpoint is placed by its cumulative bytes"
+        );
+        let called = json!([
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c", "type": "function", "function": {"name": "ls", "arguments": "{}"}}]}
+        ]);
+        assert_eq!(
+            markers(&called, None),
+            vec![(
+                CacheBoundary::Message(Count(2)),
+                Marked::Unmarked,
+                Automatic::Default
+            )],
+            "a turn ending in tool calls takes the write at its boundary"
+        );
+        let merged = json!([{"role": "user", "content": [marked("a"), marked("b"), marked("c"), marked("d"), marked("e")]}]);
+        assert_eq!(
+            markers(&merged, None),
+            vec![
+                (part(1, 2), Marked::Explicit, Automatic::Not),
+                (part(1, 3), Marked::Explicit, Automatic::Not),
+                (part(1, 4), Marked::Explicit, Automatic::Not),
+                (part(1, 5), Marked::Explicit, Automatic::Default),
+            ],
+            "four writes are kept when the automatic one joins a breakpoint"
+        );
+        let apart = json!([{"role": "user", "content": [marked("a"), marked("b"), marked("c"), marked("d"), {"type": "text", "text": "e"}]}]);
+        assert_eq!(
+            markers(&apart, None),
+            vec![
+                (part(1, 2), Marked::Explicit, Automatic::Not),
+                (part(1, 3), Marked::Explicit, Automatic::Not),
+                (part(1, 4), Marked::Explicit, Automatic::Not),
+                (part(1, 5), Marked::Unmarked, Automatic::Default),
+            ],
+            "three breakpoints are kept when the automatic write needs its own slot"
+        );
+        assert_eq!(
+            markers(&apart, Some(json!({"mode": "explicit"}))).len(),
+            4,
+            "without the automatic write all four breakpoints are kept"
+        );
+    }
 
     #[test]
     fn integers_are_checked_and_bounded()

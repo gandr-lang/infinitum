@@ -17,6 +17,7 @@ use infinitum_round::TokenId;
 use crate::bridge::ffi;
 use crate::options::ChatTemplate;
 use crate::options::CudaGraph;
+use crate::options::DeviceStateSlots;
 use crate::options::EngineOptions;
 use crate::options::KvCapacity;
 use crate::options::KvStorage;
@@ -587,6 +588,13 @@ impl Session
             },
             prefill_chunk: core::num::NonZeroU32::from(options.prefill_chunk()).get(),
             max_concurrency: core::num::NonZeroU32::from(options.concurrency()).get(),
+            device_state_set: matches!(options.device_state(), DeviceStateSlots::Exactly(_)),
+            device_state_slots: match options.device_state() {
+                | DeviceStateSlots::PerLane => 0,
+                | DeviceStateSlots::Exactly(slots) => slots.0,
+            },
+            host_state_slots: options.host_state().0,
+            host_kv_bytes: options.host_kv().0,
             pending_timeout_ms: core::num::NonZeroU32::from(options.pending_timeout()).get(),
             draft_width: core::num::NonZeroU32::from(plan.width()).get(),
             cuda_graph: match options.cuda_graph() {

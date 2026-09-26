@@ -12,6 +12,7 @@ All notable changes to infinitum are documented here.
 - _(engine)_ Configure serve's output, admission and body limits (#10)
 - _(engine)_ Size and store serve's KV cache (#11)
 - _(engine)_ Run serve's requests on concurrent Engine lanes (#12)
+- _(engine)_ Reuse served prompt state across requests (#13)
 
 ### Unreleased Bug Fixes
 
