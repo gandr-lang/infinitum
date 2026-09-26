@@ -87,6 +87,11 @@ pub struct Server
     /// it to the context left after the prompt.
     #[arg(long, value_name = "TOKENS", default_value = "8192")]
     default_max_tokens: OutputTokens,
+    /// The thinking budget of a request that does not turn thinking off; its
+    /// control tokens count toward the output limit. Absent, thinking runs
+    /// until the model closes it or the output limit binds.
+    #[arg(long, value_name = "TOKENS")]
+    default_thinking_budget: Option<OutputTokens>,
     /// How long a request may wait for admission before it is refused.
     #[arg(long, value_name = "MILLISECONDS", default_value = "30000")]
     pending_timeout_ms: PendingTimeout,
@@ -115,7 +120,7 @@ pub struct Server
     model_id: Option<String>,
 }
 
-/// A positive output limit in tokens.
+/// A positive token count: an output limit or a thinking budget.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputTokens(core::num::NonZeroU32);
@@ -128,9 +133,9 @@ impl core::str::FromStr for OutputTokens
     ///
     /// # Specification
     /// - requires: nothing.
-    /// - ensures: on success the limit is the parsed value, at least one.
-    /// - provides: `--default-max-tokens`, refusing zero as ninfer's server
-    ///   does.
+    /// - ensures: on success the count is the parsed value, at least one.
+    /// - provides: `--default-max-tokens` and `--default-thinking-budget`,
+    ///   refusing zero as ninfer's server does.
     /// - fails: with the integer parser's error on zero, a negative value,
     ///   anything above `u32::MAX`, or a non-numeric string.
     /// - panics: none.
@@ -441,7 +446,13 @@ where
     use infinitum_chat::ChatBackend as _;
 
     let engine = infinitum_ninfer::ChatEngine::open(options, plan).map_err(ServeFailure::Engine)?;
-    infinitum_serve::warm_up(&engine).map_err(ServeFailure::WarmUp)?;
+    let thinking_budget = server.default_thinking_budget.map_or(
+        infinitum_chat::ThinkingBudget::Unlimited,
+        |budget| {
+            return infinitum_chat::ThinkingBudget::Tokens(budget.0);
+        },
+    );
+    infinitum_serve::warm_up(&engine, thinking_budget).map_err(ServeFailure::WarmUp)?;
     let model = server
         .model_id
         .clone()
@@ -460,6 +471,7 @@ where
         )),
         defaults: infinitum_serve::Defaults {
             output_tokens: infinitum_round::TokenCount::from(server.default_max_tokens.0),
+            thinking_budget,
         },
         max_request: infinitum_serve::RequestBytes(server.max_request_mib.0),
     };

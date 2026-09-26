@@ -741,8 +741,9 @@ async fn chat(
 /// # Specification
 /// - requires: nothing.
 /// - ensures: on success the backend has generated up to four tokens for a
-///   one-turn `hi` prompt, with model sampling defaults and the prefix cache
-///   neither read nor written, as ninfer's server warms up.
+///   one-turn `hi` prompt, with model sampling defaults, the default thinking
+///   budget `thinking_budget`, and the prefix cache neither read nor written,
+///   as ninfer's server warms up.
 /// - provides: the start-up warm-up.
 /// - fails: when the request fails.
 /// - panics: none.
@@ -755,7 +756,10 @@ async fn chat(
 ///   out of the prefix cache and cheap.
 /// - witness: `tests::warm_up_neither_reads_nor_writes_the_prefix_cache`
 #[inline]
-pub fn warm_up(backend: &dyn ChatBackend) -> Result<(), infinitum_chat::ChatFailure>
+pub fn warm_up(
+    backend: &dyn ChatBackend,
+    thinking_budget: infinitum_chat::ThinkingBudget,
+) -> Result<(), infinitum_chat::ChatFailure>
 {
     let request = ChatRequest {
         prompt: infinitum_chat::Prompt {
@@ -782,7 +786,7 @@ pub fn warm_up(backend: &dyn ChatBackend) -> Result<(), infinitum_chat::ChatFail
             seed: fresh_bits().0,
             post_thinking: infinitum_chat::Sampling::MODEL_DEFAULT,
             post_thinking_seed: infinitum_chat::Seed::Inherited,
-            thinking_budget: infinitum_chat::ThinkingBudget::Unlimited,
+            thinking_budget,
             stops: Vec::new(),
             stop_scope: infinitum_chat::StopScope::Content,
             special_tokens: infinitum_chat::SpecialTokens::Trimmed,
@@ -974,6 +978,7 @@ mod tests
                 max_model_len: TokenCount::from(64_u32),
                 defaults: Defaults {
                     output_tokens: TokenCount::from(8_u32),
+                    thinking_budget: infinitum_chat::ThinkingBudget::Unlimited,
                 },
                 max_request: RequestBytes(core::num::NonZeroUsize::new(1024).unwrap()),
             },
@@ -1077,7 +1082,10 @@ mod tests
     fn warm_up_neither_reads_nor_writes_the_prefix_cache()
     {
         assert_eq!(
-            warm_up(&WarmUpOnly(ModelName(String::from("m")))),
+            warm_up(
+                &WarmUpOnly(ModelName(String::from("m"))),
+                infinitum_chat::ThinkingBudget::Unlimited
+            ),
             Ok(()),
             "the warm-up is ninfer's: four aggregate uncached tokens"
         );

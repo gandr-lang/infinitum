@@ -430,6 +430,7 @@ mod tests
     {
         for flag in [
             "--default-max-tokens",
+            "--default-thinking-budget",
             "--pending-timeout-ms",
             "--max-request-mib",
         ] {

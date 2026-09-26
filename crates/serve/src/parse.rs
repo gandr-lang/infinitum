@@ -89,12 +89,13 @@ pub enum Usage
 pub struct FreshSeed(pub u64);
 
 /// Server-side settings a request falls back on.
-#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Defaults
 {
     /// Output tokens when the request names none.
     pub output_tokens: TokenCount,
+    /// The thinking budget of a request that does not turn thinking off.
+    pub thinking_budget: ThinkingBudget,
 }
 
 /// A JSON member name.
@@ -2157,7 +2158,9 @@ fn output_tokens(
 /// - ensures: on success the chat request renders and runs as ninfer's server
 ///   renders and runs the same body: the same turns, tool definitions, template
 ///   arguments and choices, output limit, sampling for both phases, seeds,
-///   stops, special-token handling and tool-name limit.
+///   stops, special-token handling and tool-name limit; the default thinking
+///   budget applies unless thinking is turned off, by `enable_thinking` or by
+///   effort `none`.
 /// - provides: the chat surface's request translation.
 /// - fails: with ninfer's parameter and code for every body it refuses.
 /// - panics: none.
@@ -2293,6 +2296,12 @@ pub fn chat_request(
     };
     let output_tokens = output_tokens(body, defaults)?;
     let (thinking, preserve_thinking, effort, template_arguments) = template_choices(body)?;
+    let thinking_budget = if thinking == Switch::Off || effort == Effort::None {
+        ThinkingBudget::Unlimited
+    }
+    else {
+        defaults.thinking_budget
+    };
     let offered = tool_use == ToolUse::Auto && !declared.is_empty();
     let tool_history = turns.iter().any(|turn| {
         return turn.message.role == Role::Tool || !turn.message.tool_calls.is_empty();
@@ -2334,7 +2343,7 @@ pub fn chat_request(
                 seed,
                 post_thinking: post_thinking.0,
                 post_thinking_seed: post_thinking.1,
-                thinking_budget: ThinkingBudget::Unlimited,
+                thinking_budget,
                 stops,
                 stop_scope,
                 special_tokens,
@@ -2364,6 +2373,7 @@ mod tests
     use infinitum_chat::StopScope;
     use infinitum_chat::StructuralPrefixes;
     use infinitum_chat::Switch;
+    use infinitum_chat::ThinkingBudget;
     use infinitum_round::Maybe;
     use infinitum_round::TokenCount;
     use serde_json::json;
@@ -2383,6 +2393,7 @@ mod tests
     /// The defaults the tests translate under.
     const DEFAULTS: Defaults = Defaults {
         output_tokens: TokenCount::ZERO,
+        thinking_budget: ThinkingBudget::Unlimited,
     };
 
     /// The cache markers ninfer's server derives for `messages`, with
@@ -2423,6 +2434,48 @@ mod tests
                  }| return (boundary, marked, automatic),
             )
             .collect();
+    }
+
+    /// The default budget reaches a request that leaves thinking on or to the
+    /// model, and not one that turns it off either way.
+    #[test]
+    fn the_default_thinking_budget_skips_requests_without_thinking()
+    {
+        let budget = ThinkingBudget::Tokens(core::num::NonZeroU32::MIN);
+        let defaults = Defaults {
+            thinking_budget: budget,
+            ..DEFAULTS
+        };
+        let cases = [
+            (json!({}), budget, "left to the model"),
+            (
+                json!({"chat_template_kwargs": {"enable_thinking": true}}),
+                budget,
+                "turned on",
+            ),
+            (
+                json!({"chat_template_kwargs": {"enable_thinking": false}}),
+                ThinkingBudget::Unlimited,
+                "turned off",
+            ),
+            (
+                json!({"reasoning_effort": "none"}),
+                ThinkingBudget::Unlimited,
+                "effort none",
+            ),
+            (json!({"reasoning_effort": "low"}), budget, "effort low"),
+        ];
+        for (extra, expected, case) in cases {
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "u"}]});
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            let parsed = chat_request(&body, defaults, FreshSeed(0)).unwrap();
+            assert_eq!(
+                parsed.request.generation.thinking_budget, expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]
