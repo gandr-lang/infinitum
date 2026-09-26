@@ -1,0 +1,33 @@
+# infinitum's ninfer backend: the planner that maps a round graph onto ninfer's
+# fused DFlash2 round, and, behind `engine`, the `cxx` bridge that runs it
+# through ninfer's C++ Engine. Without `engine` nothing links ninfer, so the
+# planner builds and tests on every host.
+[package]
+name = "infinitum-ninfer"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "The ninfer backend of the infinitum engine"
+readme = "README.md"
+repository.workspace = true
+license.workspace = true
+# Claims the native library, so the driver's build script can read where it
+# lives (`DEP_NINFER_ENGINE_LIB`) and give the binary an rpath to it.
+links = "ninfer_engine"
+publish = false
+
+[dependencies]
+cxx = { workspace = true, optional = true }
+infinitum-round.workspace = true
+
+[build-dependencies]
+cxx-build = { workspace = true, optional = true }
+
+[features]
+# Build the bridge and link ninfer's shared Engine library. The build reads
+# `INFINITUM_NINFER_INCLUDE` (ninfer's public headers) and
+# `INFINITUM_NINFER_LIB` (the directory holding `libninfer_engine.so`).
+engine = ["dep:cxx", "dep:cxx-build"]
+
+[lints]
+workspace = true

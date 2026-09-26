@@ -1,0 +1,16 @@
+# The speculative round as infinitum describes it: fragments, the graph the
+# components compose, the planning contract a backend answers, and the host's
+# per-round decision. Engine-neutral; no backend is linked here.
+[package]
+name = "infinitum-round"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "The speculative round as a graph of fragments, for the infinitum engine"
+readme = "README.md"
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
