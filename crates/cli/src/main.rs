@@ -188,10 +188,6 @@ where
 /// - panics: none. The handles are locked once and written through fallible
 ///   calls; clap leaves by process exit rather than by panic on `--help`,
 ///   `--version`, and argument errors.
-///
-/// # Adequacy
-/// - hypothesis: none in the suite — the boundary is a process, and [`run`]'s
-///   witnesses carry the behavior; the device smoke runs the binary.
 fn main() -> std::process::ExitCode
 {
     let cli = <Cli as clap::Parser>::parse();

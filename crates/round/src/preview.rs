@@ -273,18 +273,12 @@ mod tests
     use crate::token::TokenCount;
     use crate::token::TokenId;
 
-    /// Ids 0..n.
-    fn ids(count: i32) -> Vec<TokenId>
-    {
-        return (0 .. count).map(TokenId::from).collect();
-    }
-
     /// A round that exactly fills the budget is admitted whole.
     #[test]
     fn a_round_that_fits_continues()
     {
         let mut preview = Preview::new(TokenCount::from(4_u32));
-        let span = ids(4);
+        let span: Vec<TokenId> = (0_i32 .. 4_i32).map(TokenId::from).collect();
         assert_eq!(
             preview.review(RoundOffer::new(&span, RoundKind::Decode)),
             Ok(RoundVerdict::Continue),
@@ -304,13 +298,13 @@ mod tests
     fn an_overrunning_round_is_limited_to_the_remainder()
     {
         let mut preview = Preview::new(TokenCount::from(3_u32));
-        let first = ids(1);
+        let first: Vec<TokenId> = (0_i32 .. 1_i32).map(TokenId::from).collect();
         assert_eq!(
             preview.review(RoundOffer::new(&first, RoundKind::PrefillFinalization)),
             Ok(RoundVerdict::Continue),
             "the prefill token fits"
         );
-        let second = ids(3);
+        let second: Vec<TokenId> = (0_i32 .. 3_i32).map(TokenId::from).collect();
         assert_eq!(
             preview.review(RoundOffer::new(&second, RoundKind::Decode)),
             Ok(RoundVerdict::Limit(RoundLimit(NonZeroU32::new(2).unwrap()))),
@@ -339,7 +333,7 @@ mod tests
     fn a_spent_budget_admits_nothing()
     {
         let mut preview = Preview::new(TokenCount::from(1_u32));
-        let span = ids(1);
+        let span: Vec<TokenId> = (0_i32 .. 1_i32).map(TokenId::from).collect();
         assert_eq!(
             preview.review(RoundOffer::new(&span, RoundKind::PrefillFinalization)),
             Ok(RoundVerdict::Continue),

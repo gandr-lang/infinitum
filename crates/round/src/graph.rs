@@ -451,6 +451,15 @@ mod tests
     }
 
     /// Build accept then commit, optionally with a trailing publish.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: the graph is an acceptance, a KV commit reading it, and, when
+    ///   `publish` is `Publish::Yes`, a feature publish reading it.
+    /// - provides: the minimal well-formed round the comparison tests use.
+    /// - fails: never.
+    /// - panics: when the builder refuses one of these steps, which fails the
+    ///   calling test.
     fn round(publish: Publish) -> super::RoundGraph
     {
         let mut builder = RoundBuilder::new();

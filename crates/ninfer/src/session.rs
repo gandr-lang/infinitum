@@ -507,8 +507,8 @@ impl Session
     /// - [`EngineFailure::ArtifactPath`], [`EngineFailure::Thrown`]: as named.
     ///
     /// # Adequacy
-    /// - hypothesis: the Engine's own startup validation; exercised on a GPU
-    ///   host by the `generate` acceptance run.
+    /// - hypothesis: L1 — the Engine's own startup validation, exercised on a
+    ///   GPU host by the `generate` acceptance run.
     #[inline]
     pub fn open(
         options: &EngineOptions,
@@ -568,7 +568,8 @@ impl Session
     /// - [`EngineFailure::Thrown`]: ninfer threw.
     ///
     /// # Adequacy
-    /// - hypothesis: exercised on a GPU host by the `generate` acceptance run.
+    /// - hypothesis: L1 — exercised on a GPU host by the `generate` acceptance
+    ///   run.
     #[inline]
     pub fn tokenize(
         &self,
@@ -600,8 +601,9 @@ impl Session
     ///   [`EngineFailure::Preview`]: as named.
     ///
     /// # Adequacy
-    /// - hypothesis: greedy ids equal ninfer's own DFlash2 greedy run on the
-    ///   same artifact, checked on a GPU host by the `generate` acceptance run.
+    /// - hypothesis: L2 — greedy ids equal ninfer's own DFlash2 greedy run on
+    ///   the same artifact, checked on a GPU host by the `generate` acceptance
+    ///   run.
     #[inline]
     pub fn generate(
         &mut self,
@@ -680,7 +682,8 @@ impl Session
     /// - [`EngineFailure::Thrown`]: ninfer threw.
     ///
     /// # Adequacy
-    /// - hypothesis: exercised on a GPU host by the `generate` acceptance run.
+    /// - hypothesis: L1 — exercised on a GPU host by the `generate` acceptance
+    ///   run.
     #[inline]
     pub fn detokenize(
         &self,

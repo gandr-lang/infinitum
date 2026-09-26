@@ -294,7 +294,9 @@ where
 /// - [`RequestFailure::Engine`], [`RequestFailure::Output`]: as named.
 ///
 /// # Adequacy
-/// - hypothesis: none in the suite; every step needs ninfer and a device.
+/// - hypothesis: L2 outside the suite — every step needs ninfer and a device,
+///   and the device acceptance run checks the ids against ninfer's own DFlash2
+///   greedy run.
 #[cfg(feature = "ninfer")]
 fn execute<Writer>(
     request: &Request,
