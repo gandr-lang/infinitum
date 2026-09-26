@@ -53,6 +53,34 @@ pub struct Admission
     pub reused_tokens: TokenCount,
 }
 
+/// How far prefill has come, cumulative, as the backend's request clock
+/// measures it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PromptProgress
+{
+    /// Tokens in the rendered prompt.
+    pub total: TokenCount,
+    /// Prompt tokens served from a cached prefix.
+    pub reused: TokenCount,
+    /// Prompt tokens processed so far, the reused ones included.
+    pub processed: TokenCount,
+    /// Time since the request's clock started.
+    pub elapsed: core::time::Duration,
+}
+
+/// Cumulative timings at one output commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TimingObservation
+{
+    /// Tokens accepted into the sequence so far, injected control tokens
+    /// included.
+    pub generated: TokenCount,
+    /// Time the prompt took.
+    pub prompt_elapsed: core::time::Duration,
+    /// Time generation has taken so far.
+    pub generation_elapsed: core::time::Duration,
+}
+
 /// A count a backend keeps over one generation.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

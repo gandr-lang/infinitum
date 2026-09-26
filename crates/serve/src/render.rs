@@ -5,11 +5,19 @@
 //! same finish reasons, the same `usage` and llama.cpp-style `timings`, and
 //! the same chunk sequence, so a client reads either server the same way.
 
+use infinitum_chat::Admission;
 use infinitum_chat::Channel;
 use infinitum_chat::ChatOutcome;
 use infinitum_chat::DeltaText;
 use infinitum_chat::Finish;
 use infinitum_chat::GeneratedToolCall;
+use infinitum_chat::LiveTimings;
+use infinitum_chat::Observations;
+use infinitum_chat::ProgressReports;
+use infinitum_chat::PromptProgress;
+use infinitum_chat::Tally;
+use infinitum_chat::TimingObservation;
+use infinitum_round::Maybe;
 use infinitum_round::TokenCount;
 use serde_json::Value;
 use serde_json::json;
@@ -238,6 +246,24 @@ fn usage(outcome: &ChatOutcome) -> Value
     });
 }
 
+/// What a `timings` object reports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Measured
+{
+    /// The prompt accounting.
+    admission: Admission,
+    /// Tokens generated.
+    predicted: Total,
+    /// The prompt's time.
+    prompt: core::time::Duration,
+    /// Generation's time.
+    generation: core::time::Duration,
+    /// Tokens drafted.
+    drafted: Tally,
+    /// Drafted tokens accepted.
+    accepted: Tally,
+}
+
 /// The llama.cpp-style `timings` object.
 ///
 /// # Specification
@@ -247,17 +273,17 @@ fn usage(outcome: &ChatOutcome) -> Value
 ///   per-second rates divide by `prompt_n` and by the decode intervals (one
 ///   fewer than the generated tokens), zero when those are zero; the draft
 ///   counts appear only when something was drafted.
-/// - provides: the timings ninfer's server reports.
+/// - provides: the timings ninfer's server reports, final or live.
 /// - fails: never.
 /// - panics: none.
 ///
 /// # Adequacy
 /// - hypothesis: L3 — the intervals rule and the draft fields' presence.
 /// - witness: `tests::timings_follow_ninfer`
-fn timings(outcome: &ChatOutcome) -> Value
+fn measured_timings(measured: &Measured) -> Value
 {
-    let prompt = u32::from(outcome.admission.prompt_tokens);
-    let cached = u32::from(outcome.admission.reused_tokens).min(prompt);
+    let prompt = u32::from(measured.admission.prompt_tokens);
+    let cached = u32::from(measured.admission.reused_tokens).min(prompt);
     let milliseconds = |duration: core::time::Duration| return duration.as_secs_f64() * 1000.0_f64;
     #[expect(
         clippy::as_conversions,
@@ -282,9 +308,9 @@ fn timings(outcome: &ChatOutcome) -> Value
         return 1000.0_f64 * count as f64 / elapsed;
     };
     let prefilled = u64::from(prompt.saturating_sub(cached));
-    let prompt_ms = milliseconds(outcome.prompt_wall);
-    let Total(predicted) = completion_tokens(outcome);
-    let predicted_ms = milliseconds(outcome.generation_wall);
+    let prompt_ms = milliseconds(measured.prompt);
+    let Total(predicted) = measured.predicted;
+    let predicted_ms = milliseconds(measured.generation);
     let intervals = predicted.saturating_sub(1);
     let mut rendered = json!({
         "cache_n": cached,
@@ -297,16 +323,41 @@ fn timings(outcome: &ChatOutcome) -> Value
         "predicted_per_token_ms": per_token(intervals, predicted_ms),
         "predicted_per_second": per_second(intervals, predicted_ms),
     });
-    if outcome.drafted.0 != 0
+    if measured.drafted.0 != 0
         && let Value::Object(ref mut fields) = rendered
     {
-        fields.insert(String::from("draft_n"), Value::from(outcome.drafted.0));
+        fields.insert(String::from("draft_n"), Value::from(measured.drafted.0));
         fields.insert(
             String::from("draft_n_accepted"),
-            Value::from(outcome.accepted.0),
+            Value::from(measured.accepted.0),
         );
     }
     return rendered;
+}
+
+/// The outcome's `timings` object.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: [`measured_timings`] of the outcome's admission, generated
+///   tokens, prompt and generation walls, and draft counts.
+/// - provides: the final timings.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 through [`measured_timings`].
+/// - witness: `tests::timings_follow_ninfer`
+fn timings(outcome: &ChatOutcome) -> Value
+{
+    return measured_timings(&Measured {
+        admission: outcome.admission,
+        predicted: completion_tokens(outcome),
+        prompt: outcome.prompt_wall,
+        generation: outcome.generation_wall,
+        drafted: outcome.drafted,
+        accepted: outcome.accepted,
+    });
 }
 
 /// The tool calls, each with a fresh `call_` id, and with its position when
@@ -430,8 +481,17 @@ pub fn error_event(error: &ApiError) -> String
 /// The stream's closing event.
 pub const DONE: &str = "data: [DONE]\n\n";
 
-/// A streamed response's encoder: it turns the backend's deltas and outcome
-/// into chunks, keeping what it has streamed to check the outcome against.
+/// Why a stream has no live timing yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unobserved
+{
+    /// No commit has been timed.
+    BeforeFirstCommit,
+}
+
+/// A streamed response's encoder: it turns the backend's deltas, observations
+/// and outcome into chunks, keeping what it has streamed to check the outcome
+/// against.
 #[derive(Debug, Clone)]
 pub struct ChunkStream
 {
@@ -439,6 +499,12 @@ pub struct ChunkStream
     identity: Identity,
     /// Whether a usage chunk ends the stream.
     usage: Usage,
+    /// What the request asked to observe.
+    observations: Observations,
+    /// The prompt accounting, once admitted.
+    admission: Admission,
+    /// The latest commit's timings.
+    live: Maybe<TimingObservation, Unobserved>,
     /// The reasoning streamed so far.
     reasoning: String,
     /// The content streamed so far.
@@ -456,14 +522,141 @@ impl ChunkStream
     pub const fn new(
         identity: Identity,
         usage: Usage,
+        observations: Observations,
     ) -> Self
     {
         return Self {
             identity,
             usage,
+            observations,
+            admission: Admission {
+                prompt_tokens: TokenCount::ZERO,
+                reused_tokens: TokenCount::ZERO,
+            },
+            live: Maybe::Absent(Unobserved::BeforeFirstCommit),
             reasoning: String::new(),
             content: String::new(),
         };
+    }
+
+    /// Record the admission; its progress chunk when the request asked for
+    /// progress.
+    ///
+    /// # Specification
+    /// - requires: called once, after [`ChunkStream::start`] and before any
+    ///   delta.
+    /// - ensures: later timings and progress are counted against `admission`;
+    ///   with [`ProgressReports::Published`], the returned chunk carries an
+    ///   empty delta and `prompt_progress` at the reused prefix and zero time,
+    ///   as ninfer's first progress chunk does; otherwise nothing is returned.
+    /// - provides: the admission's effect on the stream.
+    /// - fails: never.
+    /// - panics: none.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 on the admission, a progress report and a live timing.
+    /// - witness: `tests::observations_ride_the_stream_as_ninfers`
+    #[inline]
+    #[must_use]
+    pub fn admitted(
+        &mut self,
+        admission: Admission,
+    ) -> Vec<String>
+    {
+        self.admission = admission;
+        if self.observations.progress == ProgressReports::Withheld {
+            return Vec::new();
+        }
+        return vec![self.progress(PromptProgress {
+            total: admission.prompt_tokens,
+            reused: admission.reused_tokens,
+            processed: admission.reused_tokens,
+            elapsed: core::time::Duration::ZERO,
+        })];
+    }
+
+    /// A progress chunk.
+    ///
+    /// # Specification
+    /// - requires: the request asked for progress.
+    /// - ensures: a chunk with an empty delta, `usage` null when a usage chunk
+    ///   will follow, and `prompt_progress` `{total, cache, processed,
+    ///   time_ms}`, the time in whole milliseconds, as ninfer's.
+    /// - provides: `return_progress`'s reports.
+    /// - fails: never.
+    /// - panics: none.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 through [`ChunkStream::admitted`].
+    /// - witness: `tests::observations_ride_the_stream_as_ninfers`
+    #[inline]
+    #[must_use]
+    pub fn progress(
+        &self,
+        progress: PromptProgress,
+    ) -> String
+    {
+        let mut payload = self.identity.payload(ObjectKind::Chunk);
+        payload.insert(
+            String::from("choices"),
+            json!([{"index": 0_i32, "delta": {}, "logprobs": null, "finish_reason": null}]),
+        );
+        if self.usage == Usage::Included {
+            payload.insert(String::from("usage"), Value::Null);
+        }
+        payload.insert(
+            String::from("prompt_progress"),
+            json!({
+                "total": u32::from(progress.total),
+                "cache": u32::from(progress.reused),
+                "processed": u32::from(progress.processed),
+                "time_ms": u64::try_from(progress.elapsed.as_millis()).unwrap_or(u64::MAX),
+            }),
+        );
+        return event(&Value::Object(payload));
+    }
+
+    /// Record one commit's cumulative timings, which the deltas that follow
+    /// carry.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    pub const fn timed(
+        &mut self,
+        timing: TimingObservation,
+    )
+    {
+        self.live = Maybe::Present(timing);
+    }
+
+    /// The `timings` a delta carries.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: with [`LiveTimings::PerCommit`], [`measured_timings`] of the
+    ///   admission and the latest commit's count and times, without draft
+    ///   counts, as ninfer's live timings; null otherwise or before any commit.
+    /// - provides: every delta's live timings.
+    /// - fails: never.
+    /// - panics: none.
+    fn live_timings(&self) -> Value
+    {
+        let Maybe::Present(timing) = self.live
+        else {
+            return Value::Null;
+        };
+        if self.observations.timings == LiveTimings::Withheld {
+            return Value::Null;
+        }
+        return measured_timings(&Measured {
+            admission: self.admission,
+            predicted: Total(u64::from(u32::from(timing.generated))),
+            prompt: timing.prompt_elapsed,
+            generation: timing.generation_elapsed,
+            drafted: Tally(0),
+            accepted: Tally(0),
+        });
     }
 
     /// A chunk with one choice carrying `delta`.
@@ -536,7 +729,7 @@ impl ChunkStream
         streamed.push_str(text.0);
         let mut delta = serde_json::Map::new();
         delta.insert(String::from(key), Value::from(text.0));
-        return self.chunk(&Value::Object(delta), &Value::Null, Value::Null);
+        return self.chunk(&Value::Object(delta), &Value::Null, self.live_timings());
     }
 
     /// The closing chunks.
@@ -580,16 +773,25 @@ impl ChunkStream
                 "terminal reasoning appeared after streamed content",
             )));
         }
+        let final_timings = timings(outcome);
+        let remainder_timings = match self.observations.timings {
+            | LiveTimings::PerCommit => final_timings.clone(),
+            | LiveTimings::Withheld => Value::Null,
+        };
         let mut events = Vec::with_capacity(6);
         if !reasoning.is_empty() {
             events.push(self.chunk(
                 &json!({"reasoning_content": reasoning}),
                 &Value::Null,
-                Value::Null,
+                remainder_timings.clone(),
             ));
         }
         if !content.is_empty() {
-            events.push(self.chunk(&json!({"content": content}), &Value::Null, Value::Null));
+            events.push(self.chunk(
+                &json!({"content": content}),
+                &Value::Null,
+                remainder_timings.clone(),
+            ));
         }
         let finish = if outcome.tool_calls.is_empty() {
             finish_reason(outcome.finish)
@@ -598,11 +800,10 @@ impl ChunkStream
             events.push(self.chunk(
                 &json!({"tool_calls": tool_calls(&outcome.tool_calls, Indexing::Indexed)}),
                 &Value::Null,
-                Value::Null,
+                remainder_timings,
             ));
             FinishReason::ToolCalls
         };
-        let final_timings = timings(outcome);
         match self.usage {
             | Usage::Omitted => {
                 events.push(self.chunk(&json!({}), &Value::from(finish), final_timings));
@@ -631,10 +832,16 @@ mod tests
     use infinitum_chat::DeltaText;
     use infinitum_chat::Finish;
     use infinitum_chat::GeneratedToolCall;
+    use infinitum_chat::LiveTimings;
+    use infinitum_chat::Observations;
+    use infinitum_chat::ProgressReports;
+    use infinitum_chat::PromptProgress;
     use infinitum_chat::Tally;
+    use infinitum_chat::TimingObservation;
     use infinitum_round::TokenCount;
     use infinitum_round::TokenId;
     use serde_json::Value;
+    use serde_json::json;
 
     use super::ChunkStream;
     use super::DONE;
@@ -809,7 +1016,11 @@ mod tests
     #[test]
     fn a_stream_finishes_with_the_remainder_and_usage()
     {
-        let mut stream = ChunkStream::new(Identity::new(String::from("m")), Usage::Included);
+        let mut stream = ChunkStream::new(
+            Identity::new(String::from("m")),
+            Usage::Included,
+            Observations::NONE,
+        );
         assert_eq!(
             payload(&Event(stream.start()))["choices"][0]["delta"]["role"],
             "assistant",
@@ -854,7 +1065,11 @@ mod tests
             "the usage chunk"
         );
         assert_eq!(terminal.last().unwrap(), DONE, "the stream closes");
-        let mut diverged = ChunkStream::new(Identity::new(String::from("m")), Usage::Omitted);
+        let mut diverged = ChunkStream::new(
+            Identity::new(String::from("m")),
+            Usage::Omitted,
+            Observations::NONE,
+        );
         let _content = diverged.delta(Channel::Content, DeltaText("x"));
         assert_eq!(
             diverged
@@ -868,6 +1083,105 @@ mod tests
                 .as_u16(),
             500_u16,
             "streamed text must prefix the outcome"
+        );
+    }
+
+    #[test]
+    fn observations_ride_the_stream_as_ninfers()
+    {
+        let admission = Admission {
+            prompt_tokens: TokenCount::from(10_u32),
+            reused_tokens: TokenCount::from(4_u32),
+        };
+        let timing = TimingObservation {
+            generated: TokenCount::from(3_u32),
+            prompt_elapsed: core::time::Duration::from_millis(12),
+            generation_elapsed: core::time::Duration::from_millis(20),
+        };
+        let mut quiet = ChunkStream::new(
+            Identity::new(String::from("m")),
+            Usage::Omitted,
+            Observations::NONE,
+        );
+        assert!(
+            quiet.admitted(admission).is_empty(),
+            "admission is silent without return_progress"
+        );
+        quiet.timed(timing);
+        assert!(
+            payload(&Event(quiet.delta(Channel::Content, DeltaText("a"))))
+                .get("timings")
+                .is_none(),
+            "deltas carry no timings without timings_per_token"
+        );
+        let mut observed = ChunkStream::new(
+            Identity::new(String::from("m")),
+            Usage::Included,
+            Observations {
+                timings: LiveTimings::PerCommit,
+                progress: ProgressReports::Published,
+            },
+        );
+        let opening = observed.admitted(admission);
+        let first = payload(&Event(opening[0].clone()));
+        assert_eq!(
+            first["prompt_progress"],
+            json!({"total": 10_i32, "cache": 4_i32, "processed": 4_i32, "time_ms": 0_i32}),
+            "the first report starts at the reused prefix"
+        );
+        assert_eq!(
+            first["choices"][0]["delta"],
+            json!({}),
+            "a report's delta is empty"
+        );
+        assert!(
+            first["usage"].is_null() && first.get("usage").is_some(),
+            "a report's usage is null when usage follows"
+        );
+        let later = payload(&Event(observed.progress(PromptProgress {
+            total: TokenCount::from(10_u32),
+            reused: TokenCount::from(4_u32),
+            processed: TokenCount::from(10_u32),
+            elapsed: core::time::Duration::from_micros(7_900),
+        })));
+        assert_eq!(
+            later["prompt_progress"]["time_ms"], 7_i32,
+            "elapsed truncates to whole milliseconds"
+        );
+        assert!(
+            payload(&Event(observed.delta(Channel::Content, DeltaText("a"))))
+                .get("timings")
+                .is_none(),
+            "a delta before any commit timing carries none"
+        );
+        observed.timed(timing);
+        let live = payload(&Event(observed.delta(Channel::Content, DeltaText("b"))));
+        assert_eq!(
+            (
+                &live["timings"]["cache_n"],
+                &live["timings"]["prompt_n"],
+                &live["timings"]["predicted_n"],
+                &live["timings"]["predicted_per_token_ms"],
+            ),
+            (
+                &json!(4_i32),
+                &json!(6_i32),
+                &json!(3_i32),
+                &json!(10.0_f64)
+            ),
+            "a delta carries the latest commit's timings"
+        );
+        let terminal = observed
+            .finish(&outcome(&Shape {
+                reasoning: "",
+                content: "abc",
+                generated: 5_usize,
+            }))
+            .unwrap();
+        assert_eq!(
+            payload(&Event(terminal[0].clone()))["timings"]["predicted_n"],
+            5_i32,
+            "the remainder carries the final timings"
         );
     }
 }

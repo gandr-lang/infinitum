@@ -429,6 +429,11 @@ pub mod ffi
         prefix_reuse: bool,
         /// Whether deltas are published as they commit.
         streaming: bool,
+        /// Whether a streamed request observes cumulative timings at each
+        /// commit.
+        live_timings: bool,
+        /// Whether a streamed request observes prefill progress.
+        prompt_progress: bool,
     }
 
     /// One generated tool call.
@@ -643,6 +648,26 @@ pub mod ffi
             text: &[u8],
         );
 
+        /// Prefill's cumulative progress: `processed` of `total` prompt
+        /// tokens, `reused` of them from a cached prefix, `elapsed_ns` into
+        /// the request.
+        fn chat_progress(
+            sink: &mut ChatSink<'_>,
+            total: u32,
+            reused: u32,
+            processed: u32,
+            elapsed_ns: u64,
+        );
+
+        /// Cumulative timings at one output commit: `generated` tokens, the
+        /// prompt's time and generation's time so far.
+        fn chat_timing(
+            sink: &mut ChatSink<'_>,
+            generated: u32,
+            prompt_ns: u64,
+            generation_ns: u64,
+        );
+
         /// Whether the consumer asked to stop.
         fn chat_cancelled(flag: &CancelFlag) -> bool;
     }
@@ -747,7 +772,9 @@ pub use crate::chat::CancelFlag;
 pub use crate::chat::ChatSink;
 pub use crate::chat::chat_admitted;
 pub use crate::chat::chat_cancelled;
+pub use crate::chat::chat_progress;
 pub use crate::chat::chat_publish;
 pub use crate::chat::chat_submitted;
+pub use crate::chat::chat_timing;
 pub use crate::session::ReviewSink;
 pub use crate::session::review_round;

@@ -4,6 +4,8 @@
 use crate::outcome::Admission;
 use crate::outcome::Channel;
 use crate::outcome::ChatOutcome;
+use crate::outcome::PromptProgress;
+use crate::outcome::TimingObservation;
 use crate::request::ChatRequest;
 
 /// A model's name, as its artifact records it.
@@ -134,6 +136,38 @@ pub trait ChatEvents
         &mut self,
         channel: Channel,
         text: DeltaText<'_>,
+    );
+
+    /// Prefill has come this far; called only when the request asked for
+    /// [`crate::ProgressReports::Published`].
+    ///
+    /// # Specification
+    /// - requires: called after [`ChatEvents::admitted`], with the admission's
+    ///   totals, and with processed counts and elapsed times that never
+    ///   decrease.
+    /// - ensures: implementation-defined.
+    /// - provides: live prefill progress.
+    /// - fails: never; as for [`ChatEvents::admitted`].
+    /// - panics: none.
+    fn progress(
+        &mut self,
+        progress: PromptProgress,
+    );
+
+    /// The cumulative timings at one output commit; called only when the
+    /// request asked for [`crate::LiveTimings::PerCommit`].
+    ///
+    /// # Specification
+    /// - requires: called after [`ChatEvents::admitted`], before the deltas the
+    ///   commit publishes, with a positive generated count, and with counts and
+    ///   generation times that never decrease.
+    /// - ensures: implementation-defined.
+    /// - provides: live timings.
+    /// - fails: never; as for [`ChatEvents::admitted`].
+    /// - panics: none.
+    fn timing(
+        &mut self,
+        timing: TimingObservation,
     );
 }
 

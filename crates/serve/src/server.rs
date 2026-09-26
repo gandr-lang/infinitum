@@ -29,7 +29,9 @@ use infinitum_chat::ChatEvents;
 use infinitum_chat::ChatRequest;
 use infinitum_chat::Delivery;
 use infinitum_chat::DeltaText;
+use infinitum_chat::PromptProgress;
 use infinitum_chat::Submission;
+use infinitum_chat::TimingObservation;
 use infinitum_round::TokenCount;
 use serde_json::json;
 
@@ -462,6 +464,30 @@ impl ChatEvents for Aggregate
     )
     {
     }
+
+    /// Nothing is streamed.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn progress(
+        &mut self,
+        _progress: PromptProgress,
+    )
+    {
+    }
+
+    /// Nothing is streamed.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn timing(
+        &mut self,
+        _timing: TimingObservation,
+    )
+    {
+    }
 }
 
 /// Whether a streamed response has begun.
@@ -522,16 +548,25 @@ impl ChatEvents for Streamed
         self.begin();
     }
 
-    /// Nothing to send: the counts arrive with the outcome.
+    /// Begin the stream and send the admission's progress chunk, if any.
     ///
     /// # Specification
-    /// trivial.
+    /// - requires: nothing.
+    /// - ensures: the stream has begun, the encoder counts against `admission`,
+    ///   and [`ChunkStream::admitted`]'s chunks are sent.
+    /// - provides: `return_progress`'s first report.
+    /// - fails: never; a closed body is ignored, its cancellation requested.
+    /// - panics: none.
     #[inline]
     fn admitted(
         &mut self,
-        _admission: Admission,
+        admission: Admission,
     )
     {
+        self.begin();
+        for chunk in self.encoder.admitted(admission) {
+            let _closed = self.body.send(chunk);
+        }
     }
 
     /// Send the delta.
@@ -552,6 +587,38 @@ impl ChatEvents for Streamed
         self.begin();
         let chunk = self.encoder.delta(channel, text);
         let _closed = self.body.send(chunk);
+    }
+
+    /// Send the progress chunk.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: the stream has begun and the report's chunk is sent.
+    /// - provides: `return_progress`'s reports.
+    /// - fails: never; a closed body is ignored, its cancellation requested.
+    /// - panics: none.
+    #[inline]
+    fn progress(
+        &mut self,
+        progress: PromptProgress,
+    )
+    {
+        self.begin();
+        let chunk = self.encoder.progress(progress);
+        let _closed = self.body.send(chunk);
+    }
+
+    /// Record the timings the next deltas carry.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn timing(
+        &mut self,
+        timing: TimingObservation,
+    )
+    {
+        self.encoder.timed(timing);
     }
 }
 
@@ -672,7 +739,7 @@ async fn streamed(
     let (decision, decided) = tokio::sync::oneshot::channel();
     let (body, events) = tokio::sync::mpsc::unbounded_channel();
     let backend = Arc::clone(&shared.backend);
-    let encoder = ChunkStream::new(identity, include_usage);
+    let encoder = ChunkStream::new(identity, include_usage, request.observations);
     let _running = tokio::task::spawn_blocking(move || {
         let mut sink = Streamed {
             encoder,
@@ -870,6 +937,7 @@ pub fn warm_up(
             prefix_reuse: infinitum_chat::PrefixReuse::Disabled,
         },
         delivery: Delivery::Aggregate,
+        observations: infinitum_chat::Observations::NONE,
     };
     let started = std::time::Instant::now();
     backend.run(&request, &mut Aggregate, &CancelToken::new())?;

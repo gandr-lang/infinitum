@@ -250,17 +250,33 @@ public:
         chat_admitted(sink_, start.prompt.prompt_tokens, start.reused_prompt_tokens);
     }
 
-    /// Ignore prompt progress, which the chat surface does not publish.
+    /// Forward prefill's cumulative progress, which the Engine publishes only when the request's
+    /// observation options ask for it.
     ///
     /// # Specification
-    /// trivial.
-    void progress(::ninfer::PromptProgress) noexcept override {}
+    /// - requires: nothing.
+    /// - ensures: the Rust sink received the counts and the elapsed nanoseconds.
+    /// - provides: `return_progress`'s reports.
+    /// - fails: never.
+    /// - panics: none.
+    void progress(::ninfer::PromptProgress progress) noexcept override {
+        chat_progress(sink_, progress.total_prompt_tokens, progress.reused_prompt_tokens,
+                      progress.processed_prompt_tokens, progress.elapsed_ns);
+    }
 
-    /// Ignore live timings, which the chat surface does not publish.
+    /// Forward one commit's cumulative timings, which the Engine publishes only when the
+    /// request's observation options ask for them.
     ///
     /// # Specification
-    /// trivial.
-    void timing(::ninfer::GenerationTimingObservation) noexcept override {}
+    /// - requires: nothing.
+    /// - ensures: the Rust sink received the count and both times.
+    /// - provides: `timings_per_token`'s observations.
+    /// - fails: never.
+    /// - panics: none.
+    void timing(::ninfer::GenerationTimingObservation timing) noexcept override {
+        chat_timing(sink_, timing.generated_tokens, timing.prompt_elapsed_ns,
+                    timing.generation_elapsed_ns);
+    }
 
     /// Forward one delta's bytes on its channel.
     ///
@@ -742,7 +758,9 @@ void run_chat(const Session& session, const ChatPrompt& prompt, const ChatSettin
         if (!thinking_open) { request.execution.thinking.budget.reset(); }
         const std::uint32_t thinking_budget = request.execution.thinking.budget.value_or(0);
         ::ninfer::GenerationObservationOptions observation;
-        observation.phase_timings = true;
+        observation.phase_timings   = true;
+        observation.live_timings    = settings.live_timings;
+        observation.prompt_progress = settings.prompt_progress;
         auto handle = session.engine.submit(std::move(prepared), std::move(request),
                                             settings.streaming
                                                 ? ::ninfer::OutputConsumerMode::Streaming
