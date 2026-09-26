@@ -675,6 +675,20 @@ mod tests
             generation_wall: core::time::Duration::from_millis(40),
             drafted: Tally(0),
             accepted: Tally(0),
+            telemetry: infinitum_chat::Telemetry {
+                first_token: core::time::Duration::ZERO,
+                total: core::time::Duration::ZERO,
+                prefill: core::time::Duration::ZERO,
+                decode: core::time::Duration::ZERO,
+                queue_wait: core::time::Duration::ZERO,
+                reuse: infinitum_chat::ReusePath::Root,
+                thinking: infinitum_chat::ThinkingSpend {
+                    budget: infinitum_chat::ThinkingBudget::Unlimited,
+                    model_tokens: TokenCount::ZERO,
+                    injected_tokens: TokenCount::ZERO,
+                },
+                accepted_per_position: Vec::new(),
+            },
         };
     }
 

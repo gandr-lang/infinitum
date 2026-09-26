@@ -29,15 +29,19 @@ use infinitum_chat::ChatEvents;
 use infinitum_chat::ChatRequest;
 use infinitum_chat::Delivery;
 use infinitum_chat::DeltaText;
+use infinitum_chat::Submission;
 use infinitum_round::TokenCount;
 use serde_json::json;
 
 use crate::error::ApiError;
 use crate::error::Code;
 use crate::error::Param;
+use crate::oplog::Logged;
+use crate::oplog::RequestId;
+use crate::oplog::RequestShape;
 use crate::parse::Defaults;
 use crate::parse::FreshSeed;
-use crate::parse::ParsedChat;
+use crate::parse::Usage;
 use crate::parse::chat_request;
 use crate::render::ChunkStream;
 use crate::render::Identity;
@@ -144,6 +148,18 @@ pub struct ServeConfig
     pub defaults: Defaults,
     /// The largest request body accepted.
     pub max_request: RequestBytes,
+    /// How often throughput is logged.
+    pub stats: StatsInterval,
+}
+
+/// How often the server logs throughput.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsInterval
+{
+    /// Never.
+    Off,
+    /// At this period, for intervals that saw activity.
+    Every(core::time::Duration),
 }
 
 /// What every handler shares.
@@ -153,6 +169,27 @@ struct Shared
     backend: Arc<dyn ChatBackend>,
     /// The configuration.
     config: ServeConfig,
+    /// The last request number the log used.
+    requests: core::sync::atomic::AtomicU64,
+}
+
+impl Shared
+{
+    /// Number the next request.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: a number one more than the last, from one.
+    /// - provides: the log's `req#` numbers.
+    /// - fails: never.
+    /// - panics: none.
+    fn next_request(&self) -> RequestId
+    {
+        let last = self
+            .requests
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return RequestId(last.saturating_add(1));
+    }
 }
 
 /// A JSON response.
@@ -394,7 +431,10 @@ impl ChatEvents for Aggregate
     /// # Specification
     /// trivial.
     #[inline]
-    fn submitted(&mut self)
+    fn submitted(
+        &mut self,
+        _submission: Submission,
+    )
     {
     }
 
@@ -474,7 +514,10 @@ impl ChatEvents for Streamed
     /// # Specification
     /// trivial.
     #[inline]
-    fn submitted(&mut self)
+    fn submitted(
+        &mut self,
+        _submission: Submission,
+    )
     {
         self.begin();
     }
@@ -571,9 +614,10 @@ impl tokio_stream::Stream for EventBody
 /// Run an aggregate request.
 ///
 /// # Specification
-/// - requires: nothing.
+/// - requires: `shape` is `request`'s.
 /// - ensures: 200 with the completion, or the failure's error response; if the
-///   handler is dropped first, the request is cancelled.
+///   handler is dropped first, the request is cancelled; the request's start
+///   and end are logged.
 /// - provides: non-streamed completions.
 /// - fails: never; failures are responses.
 /// - panics: none.
@@ -581,17 +625,25 @@ async fn aggregate(
     shared: Arc<Shared>,
     identity: Identity,
     request: ChatRequest,
+    shape: RequestShape,
 ) -> Response
 {
     let cancel = CancelToken::new();
     let _guard = CancelOnDrop(cancel.clone());
     let backend = Arc::clone(&shared.backend);
-    let ran =
-        tokio::task::spawn_blocking(move || return backend.run(&request, &mut Aggregate, &cancel))
-            .await;
+    let ran = tokio::task::spawn_blocking(move || {
+        let mut aggregate = Aggregate;
+        let mut events = Logged::new(&mut aggregate, shape);
+        let ran = backend
+            .run(&request, &mut events, &cancel)
+            .map_err(ApiError::from_failure);
+        events.end(ran.as_ref());
+        return ran;
+    })
+    .await;
     return match ran {
         | Ok(Ok(outcome)) => json_response(StatusCode::OK, completion(&identity, &outcome)),
-        | Ok(Err(failure)) => error_response(&ApiError::from_failure(failure)),
+        | Ok(Err(error)) => error_response(&error),
         | Err(join) => error_response(&ApiError::internal(join.to_string())),
     };
 }
@@ -599,18 +651,20 @@ async fn aggregate(
 /// Run a streamed request.
 ///
 /// # Specification
-/// - requires: nothing.
+/// - requires: `shape` is `request`'s.
 /// - ensures: a failure before submission is an error response; after it, a 200
 ///   event stream of the opening chunk, the deltas, and either the closing
 ///   chunks or an error event; dropping the handler or the body cancels the
-///   request.
+///   request; the request's start and end are logged.
 /// - provides: streamed completions.
 /// - fails: never; failures are responses or events.
 /// - panics: none.
 async fn streamed(
     shared: Arc<Shared>,
-    parsed: ParsedChat,
+    request: ChatRequest,
+    include_usage: Usage,
     identity: Identity,
+    shape: RequestShape,
 ) -> Response
 {
     let cancel = CancelToken::new();
@@ -618,18 +672,20 @@ async fn streamed(
     let (decision, decided) = tokio::sync::oneshot::channel();
     let (body, events) = tokio::sync::mpsc::unbounded_channel();
     let backend = Arc::clone(&shared.backend);
-    let request = parsed.request;
-    let encoder = ChunkStream::new(identity, parsed.include_usage);
+    let encoder = ChunkStream::new(identity, include_usage);
     let _running = tokio::task::spawn_blocking(move || {
         let mut sink = Streamed {
             encoder,
             body,
             begun: Begun::Pending(decision),
         };
-        let ran = backend.run(&request, &mut sink, &cancel);
+        let mut events = Logged::new(&mut sink, shape);
+        let ran = backend
+            .run(&request, &mut events, &cancel)
+            .map_err(ApiError::from_failure);
+        events.end(ran.as_ref());
         let terminal = match ran {
-            | Err(failure) => {
-                let error = ApiError::from_failure(failure);
+            | Err(error) => {
                 if let Begun::Pending(decision) =
                     core::mem::replace(&mut sink.begun, Begun::Streaming)
                 {
@@ -680,9 +736,12 @@ async fn streamed(
 /// # Specification
 /// - requires: nothing.
 /// - ensures: a body over the configured cap is 413 `request_too_large` with
-///   ninfer's message; a body that is not JSON is 400; a refused body is its
-///   translation error; another model id is 404 `model_not_found`; otherwise
-///   the request runs aggregate or streamed as it asks.
+///   ninfer's message; a body that is not JSON is 400; a body refused while
+///   parsing is its translation error; another model id is 404
+///   `model_not_found`; none of these is numbered or logged, as ninfer's are
+///   not. Otherwise the request is numbered: one refused while preparing is its
+///   error, logged as rejected during prepare; the rest run aggregate or
+///   streamed as they ask.
 /// - provides: chat completions.
 /// - fails: never; failures are responses.
 /// - panics: none.
@@ -728,10 +787,26 @@ async fn chat(
     if parsed.model != shared.config.model {
         return error_response(&model_not_found(&parsed.model));
     }
-    let identity = Identity::new(parsed.model.0.clone());
+    let id = shared.next_request();
+    let request = match parsed.prepared {
+        | Ok(request) => request,
+        | Err(error) => {
+            crate::oplog::emit(&crate::oplog::rejected(
+                id,
+                parsed.delivery,
+                parsed.counts,
+                &error,
+            ));
+            return error_response(&error);
+        },
+    };
+    let shape = RequestShape::of(id, parsed.counts, &request);
+    let identity = Identity::new(parsed.model.0);
     return match parsed.delivery {
-        | Delivery::Aggregate => aggregate(shared, identity, parsed.request).await,
-        | Delivery::Streaming => streamed(shared, parsed, identity).await,
+        | Delivery::Aggregate => aggregate(shared, identity, request, shape).await,
+        | Delivery::Streaming => {
+            streamed(shared, request, parsed.include_usage, identity, shape).await
+        },
     };
 }
 
@@ -743,7 +818,8 @@ async fn chat(
 /// - ensures: on success the backend has generated up to four tokens for a
 ///   one-turn `hi` prompt, with model sampling defaults, the default thinking
 ///   budget `thinking_budget`, and the prefix cache neither read nor written,
-///   as ninfer's server warms up.
+///   as ninfer's server warms up; a warm-up of a quarter second or more logs
+///   `warmup complete | <duration>`, as ninfer's does at its info level.
 /// - provides: the start-up warm-up.
 /// - fails: when the request fails.
 /// - panics: none.
@@ -795,29 +871,48 @@ pub fn warm_up(
         },
         delivery: Delivery::Aggregate,
     };
-    return backend
-        .run(&request, &mut Aggregate, &CancelToken::new())
-        .map(|_outcome| {});
+    let started = std::time::Instant::now();
+    backend.run(&request, &mut Aggregate, &CancelToken::new())?;
+    let elapsed = started.elapsed();
+    if elapsed.as_secs_f64() >= 0.25_f64 {
+        crate::oplog::emit(&crate::oplog::Record {
+            severity: crate::oplog::Severity::Info,
+            message: format!(
+                "warmup complete | {}",
+                crate::pretty::Duration(elapsed.as_secs_f64())
+            ),
+        });
+    }
+    return Ok(());
 }
 
-/// Serve the chat surface on `listener` until the listener fails.
+/// Serve the chat surface on `listener` until an interrupt or termination
+/// signal asks it to stop.
 ///
 /// # Specification
-/// - requires: called within a multi-threaded tokio runtime with timers.
-/// - ensures: the four routes answer as their handlers specify, behind the
-///   gate, with request bodies capped at the configured size.
+/// - requires: called within a multi-threaded tokio runtime with timers and
+///   signal handling.
+/// - ensures: the ready line is logged, then the four routes answer as their
+///   handlers specify, behind the gate, with request bodies capped at the
+///   configured size, while throughput is logged at the configured interval; on
+///   SIGINT or SIGTERM (Ctrl-C off Unix) the server stops as [`serve_with`]
+///   stops, as ninfer's server stops on those signals.
 /// - provides: `infinitum serve`'s server.
-/// - fails: when accepting fails.
+/// - fails: when the listener has no address, the signal handlers cannot be
+///   installed, or accepting fails.
 /// - panics: none.
 ///
 /// # Errors
-/// - [`std::io::Error`]: the server stopped.
+/// - [`std::io::Error`]: the server could not start or failed.
 ///
 /// # Adequacy
 /// - hypothesis: L2 — `tests::routes_answer_through_the_gate` drives the router
-///   with a scripted backend; the served comparison against `ninfer-serve`
+///   with a scripted backend, the `termination` integration test stops a
+///   running server in its own process, and [`serve_with`]'s witness holds the
+///   reporter across shutdown; the served comparison against `ninfer-serve`
 ///   checks the engine path end to end.
 /// - witness: `tests::routes_answer_through_the_gate`
+/// - witness: `termination::tests::a_termination_signal_stops_the_server`
 #[inline]
 pub async fn serve(
     listener: tokio::net::TcpListener,
@@ -825,7 +920,224 @@ pub async fn serve(
     config: ServeConfig,
 ) -> Result<(), std::io::Error>
 {
-    return axum::serve(listener, router(backend, config)).await;
+    let stop = stop_requested()?;
+    return serve_with(listener, backend, config, stop, crate::oplog::emit).await;
+}
+
+/// Serve until `stop` completes, writing the server's lines through `log`.
+///
+/// # Specification
+/// - requires: called within a multi-threaded tokio runtime with timers.
+/// - ensures: as [`serve`], with `stop` as the stop request; once it completes,
+///   the server stops accepting and finishes its open connections, then the
+///   throughput reporter is stopped and joined, so a sample it had begun writes
+///   its line first, and `server stopped` is the last line.
+/// - provides: [`serve`]'s body, with the stop and the log injectable.
+/// - fails: when the listener has no address or accepting fails.
+/// - panics: none.
+///
+/// # Errors
+/// - [`std::io::Error`]: the server could not start or failed.
+///
+/// # Adequacy
+/// - hypothesis: L3 on a stop arriving while the reporter is inside a sample.
+/// - witness: `tests::the_stop_line_follows_an_inflight_throughput_sample`
+async fn serve_with<Stop, Log>(
+    listener: tokio::net::TcpListener,
+    backend: Arc<dyn ChatBackend>,
+    config: ServeConfig,
+    stop: Stop,
+    log: Log,
+) -> Result<(), std::io::Error>
+where
+    Stop: Future<Output = ()> + Send + 'static,
+    Log: Fn(&crate::oplog::Record) + Clone + Send + 'static,
+{
+    log(&crate::oplog::listening(
+        listener.local_addr()?,
+        &config.model,
+        &config.access,
+    ));
+    let reporter = match config.stats {
+        | StatsInterval::Every(period) => {
+            let (halt, halted) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(report_throughput(
+                Arc::clone(&backend),
+                period,
+                halted,
+                log.clone(),
+            ));
+            Some((halt, task))
+        },
+        | StatsInterval::Off => None,
+    };
+    let served = axum::serve(listener, router(backend, config))
+        .with_graceful_shutdown(stop)
+        .await;
+    if let Some((halt, task)) = reporter {
+        // The reporter takes no sample after the stop, and joining it waits
+        // out a sample under way, whose line is then written before the stop
+        // line.
+        let _finished = halt.send(());
+        let _joined = task.await;
+    }
+    served?;
+    log(&crate::oplog::Record {
+        severity: crate::oplog::Severity::Info,
+        message: String::from("server stopped"),
+    });
+    return Ok(());
+}
+
+/// A future that completes when SIGINT or SIGTERM arrives.
+///
+/// # Specification
+/// - requires: called within a tokio runtime with signal handling.
+/// - ensures: both handlers are installed before it returns, replacing an
+///   inherited ignore, and the future completes at the first of either signal.
+/// - provides: [`serve`]'s stop request.
+/// - fails: when a handler cannot be installed.
+/// - panics: none.
+///
+/// # Errors
+/// - [`std::io::Error`]: a handler could not be installed.
+///
+/// # Adequacy
+/// - hypothesis: L2 — the test sends the process SIGTERM once the server
+///   answers, and the server returns.
+/// - witness: `tests::a_termination_signal_stops_the_server`
+#[cfg(unix)]
+fn stop_requested() -> Result<impl Future<Output = ()>, std::io::Error>
+{
+    use tokio::signal::unix::SignalKind;
+    use tokio::signal::unix::signal;
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    return Ok(core::future::poll_fn(move |cx| {
+        if interrupt.poll_recv(cx).is_ready() || terminate.poll_recv(cx).is_ready() {
+            return core::task::Poll::Ready(());
+        }
+        return core::task::Poll::Pending;
+    }));
+}
+
+/// A future that completes on Ctrl-C.
+///
+/// # Specification
+/// - requires: called within a tokio runtime with signal handling.
+/// - ensures: completes at the first Ctrl-C; never, when Ctrl-C cannot be
+///   watched.
+/// - provides: [`serve`]'s stop request off Unix.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Errors
+/// - [`std::io::Error`]: never; the signature matches the Unix form.
+///
+/// # Adequacy
+/// - hypothesis: L1 — console events are process-wide; the Unix form carries
+///   the tested stop.
+/// - witness: `tests::a_termination_signal_stops_the_server`
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Unix form installs handlers that can fail"
+)]
+fn stop_requested() -> Result<impl Future<Output = ()>, std::io::Error>
+{
+    return Ok(async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            core::future::pending::<()>().await;
+        }
+    });
+}
+
+/// What the reporter does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextStep
+{
+    /// The server asked it to stop.
+    Stop,
+    /// A period elapsed: sample.
+    Sample,
+}
+
+/// Write the backend's throughput every `period` through `write`, as
+/// ninfer's stats reporter logs it, until `stop` fires or its sender is
+/// dropped.
+///
+/// # Specification
+/// - requires: called within a tokio runtime with timers.
+/// - ensures: each period, the counters are sampled and the
+///   [`crate::oplog::throughput`] line for the interval since the last sample
+///   is written when it saw activity; a late tick waits a full period from when
+///   it ran, as ninfer resets a missed deadline; a failed sample writes one
+///   warning and ends the reporter; a stop ends it before the next sample, even
+///   when that sample is already due, so a sample under way when the stop
+///   arrives is the last.
+/// - provides: the periodic throughput log.
+/// - fails: never; a failed sample ends the reporter, not the server.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 under a paused clock on a quiet interval, an active one and
+///   a failed sample; and a stop arriving mid-sample with the next tick due.
+/// - witness: `tests::throughput_reports_active_intervals_until_a_sample_fails`
+/// - witness: `tests::the_stop_line_follows_an_inflight_throughput_sample`
+async fn report_throughput<Write>(
+    backend: Arc<dyn ChatBackend>,
+    period: core::time::Duration,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    mut write: Write,
+) where
+    Write: FnMut(&crate::oplog::Record),
+{
+    let stopped = |failure: &infinitum_chat::ChatFailure| {
+        return crate::oplog::Record {
+            severity: crate::oplog::Severity::Warning,
+            message: format!("throughput reporting stopped | {}", failure.message),
+        };
+    };
+    let mut previous = match backend.counters() {
+        | Ok(counters) => counters,
+        | Err(failure) => return write(&stopped(&failure)),
+    };
+    let mut previous_time = tokio::time::Instant::now();
+    let mut ticks = tokio::time::interval_at(
+        previous_time.checked_add(period).unwrap_or(previous_time),
+        period,
+    );
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        // The stop is polled first, so a due tick never outruns it; the
+        // receiver is never polled again once it is ready.
+        let next = core::future::poll_fn(|cx| {
+            if core::pin::Pin::new(&mut stop).poll(cx).is_ready() {
+                return core::task::Poll::Ready(NextStep::Stop);
+            }
+            if ticks.poll_tick(cx).is_ready() {
+                return core::task::Poll::Ready(NextStep::Sample);
+            }
+            return core::task::Poll::Pending;
+        })
+        .await;
+        if next == NextStep::Stop {
+            return;
+        }
+        let current = match backend.counters() {
+            | Ok(counters) => counters,
+            | Err(failure) => return write(&stopped(&failure)),
+        };
+        let now = tokio::time::Instant::now();
+        if let crate::oplog::Throughput::Active(record) =
+            crate::oplog::throughput(&previous, &current, now.duration_since(previous_time))
+        {
+            write(&record);
+        }
+        previous = current;
+        previous_time = now;
+    }
 }
 
 /// The router.
@@ -838,7 +1150,11 @@ fn router(
 ) -> axum::Router
 {
     let limit = config.max_request.0.get();
-    let shared = Arc::new(Shared { backend, config });
+    let shared = Arc::new(Shared {
+        backend,
+        config,
+        requests: core::sync::atomic::AtomicU64::new(0),
+    });
     return axum::Router::new()
         .route("/health", axum::routing::get(health))
         .route("/v1/models", axum::routing::get(models))
@@ -907,6 +1223,15 @@ mod tests
             return &self.0;
         }
 
+        /// No activity.
+        ///
+        /// # Specification
+        /// trivial.
+        fn counters(&self) -> Result<infinitum_chat::RuntimeCounters, ChatFailure>
+        {
+            return Ok(infinitum_chat::RuntimeCounters::default());
+        }
+
         /// Answer "ab", streaming it as two deltas, or fail before
         /// submission when the first turn says "fail".
         ///
@@ -942,9 +1267,12 @@ mod tests
                 prompt_tokens: TokenCount::from(3_u32),
                 reused_tokens: TokenCount::ZERO,
             };
+            events.submitted(infinitum_chat::Submission {
+                thinking: infinitum_chat::Thinking::Closed,
+                thinking_budget: infinitum_chat::ThinkingBudget::Unlimited,
+            });
+            events.admitted(admission);
             if request.delivery == Delivery::Streaming {
-                events.submitted();
-                events.admitted(admission);
                 events.publish(Channel::Content, DeltaText("a"));
                 events.publish(Channel::Content, DeltaText("b"));
             }
@@ -960,6 +1288,20 @@ mod tests
                 generation_wall: core::time::Duration::ZERO,
                 drafted: Tally(0),
                 accepted: Tally(0),
+                telemetry: infinitum_chat::Telemetry {
+                    first_token: core::time::Duration::ZERO,
+                    total: core::time::Duration::ZERO,
+                    prefill: core::time::Duration::ZERO,
+                    decode: core::time::Duration::ZERO,
+                    queue_wait: core::time::Duration::ZERO,
+                    reuse: infinitum_chat::ReusePath::Root,
+                    thinking: infinitum_chat::ThinkingSpend {
+                        budget: infinitum_chat::ThinkingBudget::Unlimited,
+                        model_tokens: TokenCount::ZERO,
+                        injected_tokens: TokenCount::ZERO,
+                    },
+                    accepted_per_position: Vec::new(),
+                },
             });
         }
     }
@@ -981,6 +1323,7 @@ mod tests
                     thinking_budget: infinitum_chat::ThinkingBudget::Unlimited,
                 },
                 max_request: RequestBytes(core::num::NonZeroUsize::new(1024).unwrap()),
+                stats: super::StatsInterval::Off,
             },
         );
     }
@@ -1030,6 +1373,15 @@ mod tests
             return &self.0;
         }
 
+        /// No activity.
+        ///
+        /// # Specification
+        /// trivial.
+        fn counters(&self) -> Result<infinitum_chat::RuntimeCounters, ChatFailure>
+        {
+            return Ok(infinitum_chat::RuntimeCounters::default());
+        }
+
         /// Succeed exactly for four aggregate tokens that neither read nor
         /// write the prefix cache.
         ///
@@ -1074,6 +1426,20 @@ mod tests
                 generation_wall: core::time::Duration::ZERO,
                 drafted: Tally(0),
                 accepted: Tally(0),
+                telemetry: infinitum_chat::Telemetry {
+                    first_token: core::time::Duration::ZERO,
+                    total: core::time::Duration::ZERO,
+                    prefill: core::time::Duration::ZERO,
+                    decode: core::time::Duration::ZERO,
+                    queue_wait: core::time::Duration::ZERO,
+                    reuse: infinitum_chat::ReusePath::Root,
+                    thinking: infinitum_chat::ThinkingSpend {
+                        budget: infinitum_chat::ThinkingBudget::Unlimited,
+                        model_tokens: TokenCount::ZERO,
+                        injected_tokens: TokenCount::ZERO,
+                    },
+                    accepted_per_position: Vec::new(),
+                },
             });
         }
     }
@@ -1219,6 +1585,244 @@ mod tests
         assert!(
             body.contains(r#""code":"request_too_large""#) && body.contains("limit of 1024 bytes"),
             "the refusal is ninfer's: {body}"
+        );
+    }
+
+    /// A backend whose counter samples are scripted, oldest first.
+    struct Sampled
+    {
+        /// Its name.
+        model: ModelName,
+        /// The samples still to give.
+        samples: std::sync::Mutex<Vec<Result<infinitum_chat::RuntimeCounters, ChatFailure>>>,
+    }
+
+    impl ChatBackend for Sampled
+    {
+        /// Its name.
+        ///
+        /// # Specification
+        /// trivial.
+        fn model_name(&self) -> &ModelName
+        {
+            return &self.model;
+        }
+
+        /// The next scripted sample; a failure once the script is spent.
+        ///
+        /// # Specification
+        /// trivial.
+        fn counters(&self) -> Result<infinitum_chat::RuntimeCounters, ChatFailure>
+        {
+            let spent = ChatFailure {
+                kind: FailureKind::Internal,
+                message: String::from("script spent"),
+            };
+            return match self.samples.lock() {
+                | Ok(mut samples) if !samples.is_empty() => samples.remove(0),
+                | _ => Err(spent),
+            };
+        }
+
+        /// Refuse; the reporter never runs a request.
+        ///
+        /// # Specification
+        /// trivial.
+        fn run(
+            &self,
+            _request: &ChatRequest,
+            _events: &mut dyn ChatEvents,
+            _cancel: &CancelToken,
+        ) -> Result<ChatOutcome, ChatFailure>
+        {
+            return Err(ChatFailure {
+                kind: FailureKind::Internal,
+                message: String::from("not a chat backend"),
+            });
+        }
+    }
+
+    /// A quiet interval writes nothing, an active one writes its line over the
+    /// full period, and a failed sample writes one warning and ends the
+    /// reporter.
+    #[tokio::test(start_paused = true)]
+    async fn throughput_reports_active_intervals_until_a_sample_fails()
+    {
+        let idle = infinitum_chat::RuntimeCounters::default();
+        let busy = infinitum_chat::RuntimeCounters {
+            decode_tokens: Tally(50),
+            ..idle
+        };
+        let backend = Sampled {
+            model: ModelName(String::from("m")),
+            samples: std::sync::Mutex::new(vec![
+                Ok(idle),
+                Ok(idle),
+                Ok(busy),
+                Err(ChatFailure {
+                    kind: FailureKind::Internal,
+                    message: String::from("gone"),
+                }),
+            ]),
+        };
+        let mut lines = Vec::new();
+        let (_running, stop) = tokio::sync::oneshot::channel();
+        super::report_throughput(
+            Arc::new(backend),
+            core::time::Duration::from_secs(5),
+            stop,
+            |record: &crate::oplog::Record| lines.push(record.clone()),
+        )
+        .await;
+        assert_eq!(
+            lines,
+            [
+                crate::oplog::Record {
+                    severity: crate::oplog::Severity::Info,
+                    message: String::from(
+                        "throughput | 5.0s | decode 10.0 tok/s (50 tok) | running 0 | host 0.0% (0 us)"
+                    ),
+                },
+                crate::oplog::Record {
+                    severity: crate::oplog::Severity::Warning,
+                    message: String::from("throughput reporting stopped | gone"),
+                },
+            ],
+            "one active line, then the warning"
+        );
+    }
+
+    /// A backend whose second counter sample reports activity only once the
+    /// test releases it, telling the test when that sample has begun.
+    struct Held
+    {
+        /// Its name.
+        model: ModelName,
+        /// Samples taken so far.
+        taken: core::sync::atomic::AtomicUsize,
+        /// Told when the held sample begins.
+        entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        /// Releases the held sample.
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ChatBackend for Held
+    {
+        /// Its name.
+        ///
+        /// # Specification
+        /// trivial.
+        fn model_name(&self) -> &ModelName
+        {
+            return &self.model;
+        }
+
+        /// Idle first; then hold inside the sample until released, and report
+        /// decoded tokens.
+        ///
+        /// # Specification
+        /// trivial.
+        fn counters(&self) -> Result<infinitum_chat::RuntimeCounters, ChatFailure>
+        {
+            let idle = infinitum_chat::RuntimeCounters::default();
+            if self
+                .taken
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return Ok(idle);
+            }
+            if let Ok(entered) = self.entered.lock() {
+                let _told = entered.send(());
+            }
+            if let Ok(release) = self.release.lock() {
+                let _released = release.recv();
+            }
+            return Ok(infinitum_chat::RuntimeCounters {
+                decode_tokens: Tally(50),
+                ..idle
+            });
+        }
+
+        /// Refuse; no request is sent.
+        ///
+        /// # Specification
+        /// trivial.
+        fn run(
+            &self,
+            _request: &ChatRequest,
+            _events: &mut dyn ChatEvents,
+            _cancel: &CancelToken,
+        ) -> Result<ChatOutcome, ChatFailure>
+        {
+            return Err(ChatFailure {
+                kind: FailureKind::Internal,
+                message: String::from("not a chat backend"),
+            });
+        }
+    }
+
+    /// A stop that arrives while the reporter is inside a sample waits for
+    /// that sample's line, so `server stopped` is the last line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stop_line_follows_an_inflight_throughput_sample()
+    {
+        let (entered, entered_seen) = std::sync::mpsc::channel();
+        let (released, release) = std::sync::mpsc::channel();
+        let backend = Held {
+            model: ModelName(String::from("m")),
+            taken: core::sync::atomic::AtomicUsize::new(0),
+            entered: std::sync::Mutex::new(entered),
+            release: std::sync::Mutex::new(release),
+        };
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let written = Arc::clone(&lines);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = tokio::spawn(super::serve_with(
+            listener,
+            Arc::new(backend),
+            ServeConfig {
+                model: ModelId(String::from("m")),
+                access: Access::Open,
+                max_model_len: TokenCount::from(64_u32),
+                defaults: Defaults {
+                    output_tokens: TokenCount::from(16_u32),
+                    thinking_budget: infinitum_chat::ThinkingBudget::Unlimited,
+                },
+                max_request: RequestBytes(core::num::NonZeroUsize::new(1024).unwrap()),
+                stats: super::StatsInterval::Every(core::time::Duration::from_millis(10)),
+            },
+            async move {
+                let _asked = stopped.await;
+            },
+            move |record: &crate::oplog::Record| {
+                written.lock().unwrap().push(record.message.clone());
+            },
+        ));
+        tokio::task::spawn_blocking(move || return entered_seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        stop.send(()).unwrap();
+        tokio::time::sleep(core::time::Duration::from_millis(200)).await;
+        released.send(()).unwrap();
+        tokio::time::timeout(core::time::Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let lines = lines.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|line| return line.starts_with("throughput |")),
+            "the held sample wrote its line: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("server stopped"),
+            "nothing follows the stop line: {lines:?}"
         );
     }
 }

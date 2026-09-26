@@ -37,6 +37,7 @@ use serde_json::Value;
 use crate::error::ApiError;
 use crate::error::Code;
 use crate::error::Param;
+use crate::oplog::BodyCounts;
 use crate::server::ModelId;
 
 /// A JSON object in wire order.
@@ -60,6 +61,10 @@ pub const TOOL_NAME_LIMIT: core::num::NonZeroU32 = match core::num::NonZeroU32::
 const MAXIMUM_STOPS: usize = 4;
 
 /// What a parsed body asks the server for, beside the chat request.
+///
+/// A body passes ninfer's two stages: parsing, whose refusals are answered
+/// before the request is numbered, and preparation, whose refusals are
+/// answered and logged under the request's number.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedChat
 {
@@ -69,8 +74,10 @@ pub struct ParsedChat
     pub delivery: Delivery,
     /// Whether a streamed response ends with a usage chunk.
     pub include_usage: Usage,
-    /// The request.
-    pub request: ChatRequest,
+    /// What the log counts of the body.
+    pub counts: BodyCounts,
+    /// The request, or the first check it fails while it is prepared.
+    pub prepared: Result<ChatRequest, ApiError>,
 }
 
 /// Whether a stream carries a final usage chunk.
@@ -732,6 +739,8 @@ struct Turn
     message: Message,
     /// Whether each part, in order, carries an explicit breakpoint.
     marks: Vec<Marked>,
+    /// Its image and video parts, which carry no text.
+    media: Tally,
 }
 
 /// A cache slot as ninfer's policy sees it: empty, or a boundary with its
@@ -990,16 +999,135 @@ fn breakpoint(part: &Object) -> Result<Marked, ApiError>
     return Ok(Marked::Explicit);
 }
 
-/// A message's content as text parts, each with its breakpoint.
+/// A media part's kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Media
+{
+    /// `image_url`.
+    Image,
+    /// `video_url`.
+    Video,
+}
+
+/// Check a media part as ninfer's parser checks it, before the request is
+/// numbered and refused because vision is disabled.
+///
+/// # Specification
+/// - requires: `part`'s type names `kind`.
+/// - ensures: success when the role admits the part and the part carries a
+///   non-empty HTTP(S) or data URL, as a string or an object's `url`, with an
+///   image `detail` of `auto` when one is given.
+/// - provides: [`content_parts`]'s media parts.
+/// - fails: with ninfer's parser messages: `modality_not_supported` for an
+///   image off a user or tool turn or a video off a user turn,
+///   `image_detail_not_supported` for another detail, and no code otherwise.
+/// - panics: none.
+///
+/// # Errors
+/// - [`ApiError`]: naming `messages`.
+///
+/// # Adequacy
+/// - hypothesis: L2 — a well-formed image on a user turn passes to preparation,
+///   and one on an assistant turn is refused while parsing.
+/// - witness: `tests::preparation_refuses_in_ninfers_order`
+fn media_part(
+    part: &Object,
+    kind: Media,
+    role: Role,
+) -> Result<(), ApiError>
+{
+    let refuse = |message: String, code: Code<'_>| {
+        return Err(ApiError::invalid(message, Param("messages"), code));
+    };
+    let key = match kind {
+        | Media::Image => {
+            if role != Role::User && role != Role::Tool {
+                return refuse(
+                    String::from("image_url is only supported on user or tool messages"),
+                    Code("modality_not_supported"),
+                );
+            }
+            "image_url"
+        },
+        | Media::Video => {
+            if role != Role::User {
+                return refuse(
+                    String::from("video_url is only supported on user messages"),
+                    Code("modality_not_supported"),
+                );
+            }
+            "video_url"
+        },
+    };
+    let Some(value) = part.get(key)
+    else {
+        return refuse(format!("{key} content part must contain {key}"), Code::NONE);
+    };
+    let url = match *value {
+        | Value::String(ref url) => url.as_str(),
+        | Value::Object(ref source) => {
+            let Some(url) = source.get("url").and_then(Value::as_str)
+            else {
+                return refuse(format!("{key} must contain a string url"), Code::NONE);
+            };
+            if kind == Media::Image
+                && let Maybe::Present(detail) = field(source, Key("detail"))
+            {
+                let Some(detail) = detail.as_str()
+                else {
+                    return refuse(
+                        String::from("image_url.detail must be a string"),
+                        Code::NONE,
+                    );
+                };
+                if detail != "auto" {
+                    return refuse(
+                        format!(
+                            "image_url.detail='{detail}' requests an explicit preprocessing \
+                             profile that NInfer's fixed Vision frontend cannot apply; use 'auto'"
+                        ),
+                        Code("image_detail_not_supported"),
+                    );
+                }
+            }
+            url
+        },
+        | _ => {
+            return refuse(format!("{key} must be a URL string or object"), Code::NONE);
+        },
+    };
+    if url.is_empty() {
+        return refuse(format!("{key} URL must not be empty"), Code::NONE);
+    }
+    if !(url.starts_with("data:") || url.starts_with("http://") || url.starts_with("https://")) {
+        return refuse(format!("{key} must use HTTP(S) or a data URI"), Code::NONE);
+    }
+    return Ok(());
+}
+
+/// A message's content: its text parts, each with its breakpoint, and how
+/// many media parts it carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Content
+{
+    /// The text parts.
+    parts: Vec<(String, Marked)>,
+    /// The image and video parts.
+    media: Tally,
+}
+
+/// A message's content as text parts, each with its breakpoint, and its
+/// media parts counted.
 ///
 /// # Specification
 /// - requires: nothing.
 /// - ensures: a string is one unmarked part; an array yields its `text` parts
 ///   and, on assistant turns, its `refusal` parts, in order, each marked as its
-///   `prompt_cache_breakpoint` says.
+///   `prompt_cache_breakpoint` says, and counts its well-formed image and video
+///   parts, which the request's preparation refuses.
 /// - provides: every turn's parts.
-/// - fails: on a malformed part, a refusal off an assistant turn, or a media
-///   part, which this server refuses because vision is disabled.
+/// - fails: on a malformed part, a refusal off an assistant turn, a media part
+///   [`media_part`] refuses, or another content type.
 /// - panics: none.
 ///
 /// # Errors
@@ -1008,10 +1136,13 @@ fn content_parts(
     content: &Value,
     role: Role,
     index: Position,
-) -> Result<Vec<(String, Marked)>, ApiError>
+) -> Result<Content, ApiError>
 {
     if let Value::String(ref text) = *content {
-        return Ok(vec![(text.clone(), Marked::Unmarked)]);
+        return Ok(Content {
+            parts: vec![(text.clone(), Marked::Unmarked)],
+            media: Tally(0),
+        });
     }
     let Some(parts) = content.as_array()
     else {
@@ -1022,6 +1153,7 @@ fn content_parts(
         ));
     };
     let mut texts = Vec::with_capacity(parts.len());
+    let mut media = Tally(0);
     for part in parts {
         let Some(object) = part.as_object()
         else {
@@ -1067,11 +1199,16 @@ fn content_parts(
                     })?
             },
             | "image_url" | "video_url" => {
-                return Err(ApiError::invalid(
-                    String::from("Vision is disabled for this server"),
-                    Param("messages"),
-                    Code("vision_disabled"),
-                ));
+                let medium = if kind == "image_url" {
+                    Media::Image
+                }
+                else {
+                    Media::Video
+                };
+                media_part(object, medium, role)?;
+                let _marked = breakpoint(object)?;
+                media = Tally(media.0.saturating_add(1));
+                continue;
             },
             | other => {
                 return Err(ApiError::invalid(
@@ -1084,7 +1221,10 @@ fn content_parts(
         let marked = breakpoint(object)?;
         texts.push((String::from(text), marked));
     }
-    return Ok(texts);
+    return Ok(Content {
+        parts: texts,
+        media,
+    });
 }
 
 /// A turn's role.
@@ -1420,9 +1560,12 @@ fn message(
         }
         turn.tool_calls = assistant_calls(item, index)?;
         turn.reasoning = assistant_reasoning(item, index)?;
-        let mut parts = match field(item, Key("content")) {
+        let mut content = match field(item, Key("content")) {
             | Maybe::Present(content) => content_parts(content, role, index)?,
-            | Maybe::Absent(_) => Vec::new(),
+            | Maybe::Absent(_) => Content {
+                parts: Vec::new(),
+                media: Tally(0),
+            },
         };
         if let Maybe::Present(refusal) = field(item, Key("refusal")) {
             let Some(text) = refusal.as_str()
@@ -1434,10 +1577,10 @@ fn message(
                 ));
             };
             if !text.is_empty() {
-                parts.push((String::from(text), Marked::Unmarked));
+                content.parts.push((String::from(text), Marked::Unmarked));
             }
         }
-        return Ok(with_parts(turn, parts));
+        return Ok(with_parts(turn, content));
     }
     if let Maybe::Present(calls) = field(item, Key("tool_calls"))
         && calls.as_array().is_none_or(|list| return !list.is_empty())
@@ -1459,18 +1602,22 @@ fn message(
     return Ok(with_parts(turn, content_parts(content, role, index)?));
 }
 
-/// A turn given its parts, with their breakpoints kept beside it.
+/// A turn given its content, with each part's breakpoint kept beside it.
 ///
 /// # Specification
 /// trivial.
 fn with_parts(
     mut message: Message,
-    parts: Vec<(String, Marked)>,
+    content: Content,
 ) -> Turn
 {
-    let (texts, marks) = parts.into_iter().unzip();
+    let (texts, marks) = content.parts.into_iter().unzip();
     message.parts = texts;
-    return Turn { message, marks };
+    return Turn {
+        message,
+        marks,
+        media: content.media,
+    };
 }
 
 /// One declared tool: its name and rendered definition.
@@ -1817,28 +1964,19 @@ fn stops(body: &Object) -> Result<(Vec<String>, StopScope), ApiError>
     return Ok((texts, StopScope::ContentAndReasoning));
 }
 
-/// Which phase a set of sampling fields governs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase
-{
-    /// The request's top level: the whole generation, or thinking when a
-    /// post-thinking phase is given.
-    Initial,
-    /// `post_thinking`: the answer after thinking closes.
-    PostThinking,
-}
-
-/// One phase's sampling overrides.
+/// The post-thinking phase's sampling overrides, checked whole as ninfer's
+/// parser checks them.
 ///
 /// # Specification
 /// - requires: nothing.
 /// - ensures: each present field is carried within its range: temperature
-///   `[0,2]`, top-p and min-p `[0,1]`, top-k `[0,20]`, penalties `[-2,2]`; the
-///   value is narrowed to `f32`, as ninfer's server narrows it.
-/// - provides: the overrides of either [`Phase`].
-/// - fails: when a field is malformed, not finite (naming `sampling` at the top
-///   level, `post_thinking.temperature` in the post-thinking phase), or out of
-///   range (naming the field, with the phase's prefix).
+///   `[0,2]`, top-p and min-p `[0,1]`, penalties `[-2,2]`, top-k `[0,20]`,
+///   checked in that order; the value is narrowed to `f32`.
+/// - provides: `post_thinking`'s overrides.
+/// - fails: while parsing, when a field is malformed, not finite (`<key> must
+///   be finite`, naming the bare key, as ninfer's number reader words it), or
+///   out of range (`post_thinking.<key> is out of range`, or `must be in
+///   [0,20]` for top-k).
 /// - panics: none.
 ///
 /// # Errors
@@ -1847,51 +1985,40 @@ enum Phase
 /// # Adequacy
 /// - hypothesis: L3 at the range boundaries.
 /// - witness: `tests::sampling_ranges_are_inclusive`
-fn sampling(
-    object: &Object,
-    phase: Phase,
-) -> Result<Sampling, ApiError>
+fn post_thinking_sampling(object: &Object) -> Result<Sampling, ApiError>
 {
-    let prefix = match phase {
-        | Phase::Initial => "",
-        | Phase::PostThinking => "post_thinking.",
-    };
-    let finite = match phase {
-        | Phase::Initial => String::from("sampling"),
-        | Phase::PostThinking => String::from("post_thinking.temperature"),
-    };
-    let bounded =
-        |key: &str, minimum: f64, maximum: f64, bounds: &str| -> Result<Setting<f32>, ApiError> {
-            let Maybe::Present(Number(value)) = number(object, Key(key))?
-            else {
-                return Ok(Setting::ModelDefault);
-            };
-            if !value.is_finite() {
-                return Err(ApiError::invalid(
-                    String::from("sampling parameters must be finite"),
-                    Param(&finite),
-                    Code::NONE,
-                ));
-            }
-            if value < minimum || value > maximum {
-                let message = match phase {
-                    | Phase::Initial => format!("{key} must be in {bounds}"),
-                    | Phase::PostThinking => format!("{prefix}{key} is out of range"),
-                };
-                return Err(ApiError::invalid(
-                    message,
-                    Param(&format!("{prefix}{key}")),
-                    Code::NONE,
-                ));
-            }
-            #[expect(
-                clippy::as_conversions,
-                clippy::cast_possible_truncation,
-                reason = "the Engine samples in f32, and ninfer's server narrows the same way"
-            )]
-            let narrowed = value as f32;
-            return Ok(Setting::Set(narrowed));
+    let bounded = |key: &str, minimum: f64, maximum: f64| -> Result<Setting<f32>, ApiError> {
+        let Maybe::Present(Number(value)) = number(object, Key(key))?
+        else {
+            return Ok(Setting::ModelDefault);
         };
+        if !value.is_finite() {
+            return Err(ApiError::invalid(
+                format!("{key} must be finite"),
+                Param(key),
+                Code::NONE,
+            ));
+        }
+        if value < minimum || value > maximum {
+            return Err(ApiError::invalid(
+                format!("post_thinking.{key} is out of range"),
+                Param(&format!("post_thinking.{key}")),
+                Code::NONE,
+            ));
+        }
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "the Engine samples in f32, and ninfer's server narrows the same way"
+        )]
+        let narrowed = value as f32;
+        return Ok(Setting::Set(narrowed));
+    };
+    let temperature = bounded("temperature", 0.0_f64, 2.0_f64)?;
+    let top_p = bounded("top_p", 0.0_f64, 1.0_f64)?;
+    let min_p = bounded("min_p", 0.0_f64, 1.0_f64)?;
+    let presence_penalty = bounded("presence_penalty", -2.0_f64, 2.0_f64)?;
+    let frequency_penalty = bounded("frequency_penalty", -2.0_f64, 2.0_f64)?;
     let top_k = match integer(object, Key("top_k"))? {
         | Maybe::Absent(_) => Setting::ModelDefault,
         | Maybe::Present(Integer(value)) if (0_i32 ..= 20_i32).contains(&value) => {
@@ -1899,17 +2026,12 @@ fn sampling(
         },
         | Maybe::Present(_) => {
             return Err(ApiError::invalid(
-                format!("{prefix}top_k must be in [0,20]"),
-                Param(&format!("{prefix}top_k")),
+                String::from("post_thinking.top_k must be in [0,20]"),
+                Param("post_thinking.top_k"),
                 Code::NONE,
             ));
         },
     };
-    let temperature = bounded("temperature", 0.0_f64, 2.0_f64, "[0,2]")?;
-    let top_p = bounded("top_p", 0.0_f64, 1.0_f64, "[0,1]")?;
-    let min_p = bounded("min_p", 0.0_f64, 1.0_f64, "[0,1]")?;
-    let presence_penalty = bounded("presence_penalty", -2.0_f64, 2.0_f64, "[-2,2]")?;
-    let frequency_penalty = bounded("frequency_penalty", -2.0_f64, 2.0_f64, "[-2,2]")?;
     return Ok(Sampling {
         temperature,
         top_k,
@@ -1918,6 +2040,111 @@ fn sampling(
         presence_penalty,
         frequency_penalty,
     });
+}
+
+/// The top level's sampling overrides: their types checked while parsing,
+/// their values while preparing, as ninfer's server checks them.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: the outer result is the parsing stage, which reads `temperature`,
+///   `top_p`, `presence_penalty`, `frequency_penalty`, `top_k` and `min_p` in
+///   that order; the inner result is the preparing stage, which narrows the
+///   values to `f32` and carries them when every one is finite and within its
+///   range: temperature `[0,2]`, top-p `[0,1]`, top-k `[0,20]`, min-p `[0,1]`,
+///   penalties `[-2,2]`.
+/// - provides: the top-level overrides.
+/// - fails: while parsing, when a field is not a number or not an integer;
+///   while preparing, when a narrowed value is not finite (naming `sampling`)
+///   or out of range (`<key> must be in <range>`, naming the field), in that
+///   order.
+/// - panics: none.
+///
+/// # Errors
+/// - [`ApiError`]: as stated.
+///
+/// # Adequacy
+/// - hypothesis: L3 at the range boundaries and the stage of each refusal.
+/// - witness: `tests::sampling_ranges_are_inclusive`
+fn initial_sampling(body: &Object) -> Result<Result<Sampling, ApiError>, ApiError>
+{
+    let narrowed = |value: Maybe<Number, Unset>| -> Setting<f32> {
+        let Maybe::Present(Number(value)) = value
+        else {
+            return Setting::ModelDefault;
+        };
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "the Engine samples in f32, and ninfer's server narrows the same way before \
+                      its checks, a value beyond f32 becoming infinite"
+        )]
+        let narrow = value as f32;
+        return Setting::Set(narrow);
+    };
+    let temperature = number(body, Key("temperature"))?;
+    let top_p = number(body, Key("top_p"))?;
+    let presence_penalty = number(body, Key("presence_penalty"))?;
+    let frequency_penalty = number(body, Key("frequency_penalty"))?;
+    let top_k = integer(body, Key("top_k"))?;
+    let min_p = number(body, Key("min_p"))?;
+    let sampling = Sampling {
+        temperature: narrowed(temperature),
+        top_k: match top_k {
+            | Maybe::Present(Integer(value)) => Setting::Set(value),
+            | Maybe::Absent(_) => Setting::ModelDefault,
+        },
+        top_p: narrowed(top_p),
+        min_p: narrowed(min_p),
+        presence_penalty: narrowed(presence_penalty),
+        frequency_penalty: narrowed(frequency_penalty),
+    };
+    let floats = [
+        sampling.temperature,
+        sampling.top_p,
+        sampling.min_p,
+        sampling.presence_penalty,
+        sampling.frequency_penalty,
+    ];
+    if floats
+        .iter()
+        .any(|setting| return matches!(*setting, Setting::Set(value) if !value.is_finite()))
+    {
+        return Ok(Err(ApiError::invalid(
+            String::from("sampling parameters must be finite"),
+            Param("sampling"),
+            Code::NONE,
+        )));
+    }
+    let outside = |setting: Setting<f32>, minimum: f32, maximum: f32| {
+        return matches!(setting, Setting::Set(value) if value < minimum || value > maximum);
+    };
+    let refused = |key: &str, bounds: &str| {
+        return Ok(Err(ApiError::invalid(
+            format!("{key} must be in {bounds}"),
+            Param(key),
+            Code::NONE,
+        )));
+    };
+    if outside(sampling.temperature, 0.0_f32, 2.0_f32) {
+        return refused("temperature", "[0,2]");
+    }
+    if outside(sampling.top_p, 0.0_f32, 1.0_f32) {
+        return refused("top_p", "[0,1]");
+    }
+    if matches!(sampling.top_k, Setting::Set(value) if !(0_i32 ..= 20_i32).contains(&value)) {
+        return refused("top_k", "[0,20]");
+    }
+    if outside(sampling.min_p, 0.0_f32, 1.0_f32) {
+        return refused("min_p", "[0,1]");
+    }
+    if outside(sampling.presence_penalty, -2.0_f32, 2.0_f32) {
+        return refused("presence_penalty", "[-2,2]");
+    }
+    if outside(sampling.frequency_penalty, -2.0_f32, 2.0_f32) {
+        return refused("frequency_penalty", "[-2,2]");
+    }
+    return Ok(Ok(sampling));
 }
 
 /// A reasoning effort's name.
@@ -2006,26 +2233,29 @@ const fn switch_of(value: Flag) -> Switch
 
 /// The template choices: thinking, preserved thinking, effort, and the
 /// remaining template arguments.
+type Choices = (Switch, Switch, Effort, String);
+
+/// The template choices, read while parsing and resolved while preparing,
+/// as ninfer's server reads and resolves them.
 ///
 /// # Specification
 /// - requires: nothing.
-/// - ensures: top-level and `chat_template_kwargs` spellings of
-///   `enable_thinking`, `preserve_thinking` and `reasoning_effort` merge into
-///   one value each and leave the arguments; an effort sets thinking on unless
-///   it is `none`; the remaining arguments keep their wire order and serialize
-///   as a JSON object, `{}` when there are none.
+/// - ensures: the outer result is the parsing stage: the arguments object, the
+///   typed and nested switches and their agreement, and the typed effort; the
+///   inner result is [`semantics`]'s.
 /// - provides: the prompt options.
-/// - fails: on a malformed or conflicting choice.
+/// - fails: while parsing, on a malformed arguments object, switch or typed
+///   effort, or on conflicting switches; while preparing, as [`semantics`].
 /// - panics: none.
 ///
 /// # Errors
 /// - [`ApiError`]: naming the choice.
 ///
 /// # Adequacy
-/// - hypothesis: L3 — nested and typed spellings, their conflict, and an effort
-///   implying thinking.
+/// - hypothesis: L3 — nested and typed spellings, their conflict, an effort
+///   implying thinking, and the stage of each refusal.
 /// - witness: `tests::template_choices_merge_and_leave_the_arguments`
-fn template_choices(body: &Object) -> Result<(Switch, Switch, Effort, String), ApiError>
+fn template_choices(body: &Object) -> Result<Result<Choices, ApiError>, ApiError>
 {
     let mut kwargs = match field(body, Key("chat_template_kwargs")) {
         | Maybe::Absent(_) => Object::new(),
@@ -2042,7 +2272,7 @@ fn template_choices(body: &Object) -> Result<(Switch, Switch, Effort, String), A
     let thinking = merge_switch(&mut kwargs, Key("enable_thinking"), typed_thinking)?;
     let typed_preserve = nullable_boolean(body, Key("preserve_thinking"))?;
     let preserve = merge_switch(&mut kwargs, Key("preserve_thinking"), typed_preserve)?;
-    let mut effort = match field(body, Key("reasoning_effort")) {
+    let effort = match field(body, Key("reasoning_effort")) {
         | Maybe::Absent(_) => Effort::Unrequested,
         | Maybe::Present(value) => {
             if !value.is_string() {
@@ -2065,6 +2295,37 @@ fn template_choices(body: &Object) -> Result<(Switch, Switch, Effort, String), A
             effort
         },
     };
+    return Ok(semantics(thinking, preserve, effort, kwargs));
+}
+
+/// The prompt semantics ninfer's server resolves while preparing a request.
+///
+/// # Specification
+/// - requires: `thinking` and `preserve` are the merged switches, `effort` the
+///   typed effort, `kwargs` the arguments without the switches.
+/// - ensures: a nested `reasoning_effort` merges with the typed one and leaves
+///   the arguments; an effort sets thinking on unless it is `none`; the
+///   remaining arguments keep their wire order and serialize as a JSON object,
+///   `{}` when there are none.
+/// - provides: [`template_choices`]'s preparing stage.
+/// - fails: on a nested effort that is not a string or not a name
+///   (`invalid_template_option`), one that differs from the typed effort, or an
+///   effort against the thinking switch (`conflicting_template_option`).
+/// - panics: none.
+///
+/// # Errors
+/// - [`ApiError`]: naming `reasoning_effort`.
+///
+/// # Adequacy
+/// - hypothesis: L3 through [`template_choices`].
+/// - witness: `tests::template_choices_merge_and_leave_the_arguments`
+fn semantics(
+    thinking: Flag,
+    preserve: Flag,
+    mut effort: Effort,
+    mut kwargs: Object,
+) -> Result<Choices, ApiError>
+{
     match kwargs.shift_remove("reasoning_effort") {
         | None | Some(Value::Null) => {},
         | Some(ref name @ Value::String(_)) => {
@@ -2150,29 +2411,71 @@ fn output_tokens(
     return Ok(defaults.output_tokens);
 }
 
+/// The checks ninfer's server makes while preparing a numbered request, in its
+/// order.
+///
+/// # Specification
+/// - requires: `template` and `sampling` are the preparing stages of
+///   [`template_choices`] and [`initial_sampling`]; `media` counts the body's
+///   image and video parts.
+/// - ensures: the choices and sampling when all pass.
+/// - provides: [`chat_request`]'s preparing stage.
+/// - fails: with the template refusal, else the sampling refusal, else
+///   `vision_disabled` when media parts were sent, because this server has no
+///   vision.
+/// - panics: none.
+///
+/// # Errors
+/// - [`ApiError`]: the first refusal.
+///
+/// # Adequacy
+/// - hypothesis: L3 on each refusal and their precedence.
+/// - witness: `tests::preparation_refuses_in_ninfers_order`
+fn prepare(
+    template: Result<Choices, ApiError>,
+    sampling: Result<Sampling, ApiError>,
+    media: Tally,
+) -> Result<(Choices, Sampling), ApiError>
+{
+    let choices = template?;
+    let sampling = sampling?;
+    if media != Tally(0) {
+        return Err(ApiError::invalid(
+            String::from("Vision is disabled for this server"),
+            Param("messages"),
+            Code("vision_disabled"),
+        ));
+    }
+    return Ok((choices, sampling));
+}
+
 /// Translate a Chat Completions body.
 ///
 /// # Specification
 /// - requires: `seed_if_unset` is the fresh seed to use when the body names
 ///   none.
-/// - ensures: on success the chat request renders and runs as ninfer's server
-///   renders and runs the same body: the same turns, tool definitions, template
-///   arguments and choices, output limit, sampling for both phases, seeds,
-///   stops, special-token handling and tool-name limit; the default thinking
-///   budget applies unless thinking is turned off, by `enable_thinking` or by
-///   effort `none`.
+/// - ensures: the outer result is ninfer's parsing stage; the counts are the
+///   body's messages, declared tools and media parts; the prepared request is
+///   [`prepare`]'s refusal, or a request that renders and runs as ninfer's
+///   server renders and runs the same body: the same turns, tool definitions,
+///   template arguments and choices, output limit, sampling for both phases,
+///   seeds, stops, special-token handling and tool-name limit, the default
+///   thinking budget applying unless thinking is turned off, by
+///   `enable_thinking` or by effort `none`.
 /// - provides: the chat surface's request translation.
-/// - fails: with ninfer's parameter and code for every body it refuses.
+/// - fails: with ninfer's parameter and code for every body it refuses, at the
+///   stage it refuses it.
 /// - panics: none.
 ///
 /// # Errors
-/// - [`ApiError`]: the body is refused.
+/// - [`ApiError`]: the body is refused while parsing.
 ///
 /// # Adequacy
 /// - hypothesis: L2 — a streamed tool-using body translates to the documented
-///   fields; the served comparison against `ninfer-serve` checks rendering end
-///   to end.
+///   fields, and refusals land at ninfer's stage; the served comparison against
+///   `ninfer-serve` checks rendering end to end.
 /// - witness: `tests::a_tool_turn_translates_whole`
+/// - witness: `tests::preparation_refuses_in_ninfers_order`
 #[inline]
 pub fn chat_request(
     body: &Value,
@@ -2236,7 +2539,7 @@ pub fn chat_request(
     let post_thinking = match field(body, Key("post_thinking")) {
         | Maybe::Absent(_) => (Sampling::MODEL_DEFAULT, Seed::Inherited),
         | Maybe::Present(&Value::Object(ref object)) => {
-            let phase = sampling(object, Phase::PostThinking)?;
+            let phase = post_thinking_sampling(object)?;
             let seed = seed(object, Param("post_thinking.seed"))?;
             (phase, seed)
         },
@@ -2248,7 +2551,7 @@ pub fn chat_request(
             ));
         },
     };
-    let initial = sampling(body, Phase::Initial)?;
+    let initial = initial_sampling(body)?;
     let seed = match seed(body, Param("seed"))? {
         | Seed::Fixed(bits) => bits,
         | Seed::Inherited => seed_if_unset.0,
@@ -2295,13 +2598,7 @@ pub fn chat_request(
         },
     };
     let output_tokens = output_tokens(body, defaults)?;
-    let (thinking, preserve_thinking, effort, template_arguments) = template_choices(body)?;
-    let thinking_budget = if thinking == Switch::Off || effort == Effort::None {
-        ThinkingBudget::Unlimited
-    }
-    else {
-        defaults.thinking_budget
-    };
+    let template = template_choices(body)?;
     let offered = tool_use == ToolUse::Auto && !declared.is_empty();
     let tool_history = turns.iter().any(|turn| {
         return turn.message.role == Role::Tool || !turn.message.tool_calls.is_empty();
@@ -2311,6 +2608,19 @@ pub fn chat_request(
     }
     else {
         SpecialTokens::Trimmed
+    };
+    let counted = |length: usize| {
+        return crate::pretty::Count(u64::try_from(length).unwrap_or(u64::MAX));
+    };
+    let media = Tally(
+        turns
+            .iter()
+            .fold(0_usize, |sum, turn| return sum.saturating_add(turn.media.0)),
+    );
+    let counts = BodyCounts {
+        messages: counted(turns.len()),
+        tools: counted(declared.len()),
+        media: counted(media.0),
     };
     let tools: Vec<String> = if offered {
         declared
@@ -2323,11 +2633,15 @@ pub fn chat_request(
     };
     let cache = prompt_cache(&turns, &tools, policy)?;
     let messages = turns.into_iter().map(|turn| return turn.message).collect();
-    return Ok(ParsedChat {
-        model,
-        delivery,
-        include_usage,
-        request: ChatRequest {
+    let prepared = prepare(template, initial, media).map(|(choices, sampling)| {
+        let (thinking, preserve_thinking, effort, template_arguments) = choices;
+        let thinking_budget = if thinking == Switch::Off || effort == Effort::None {
+            ThinkingBudget::Unlimited
+        }
+        else {
+            defaults.thinking_budget
+        };
+        return ChatRequest {
             prompt: Prompt {
                 messages,
                 tools,
@@ -2339,7 +2653,7 @@ pub fn chat_request(
             },
             generation: Generation {
                 output_tokens,
-                sampling: initial,
+                sampling,
                 seed,
                 post_thinking: post_thinking.0,
                 post_thinking_seed: post_thinking.1,
@@ -2351,7 +2665,14 @@ pub fn chat_request(
                 prefix_reuse: PrefixReuse::ReadWrite,
             },
             delivery,
-        },
+        };
+    });
+    return Ok(ParsedChat {
+        model,
+        delivery,
+        include_usage,
+        counts,
+        prepared,
     });
 }
 
@@ -2382,11 +2703,11 @@ mod tests
     use super::FreshSeed;
     use super::Integer;
     use super::Key;
-    use super::Phase;
     use super::Usage;
     use super::chat_request;
+    use super::initial_sampling;
     use super::integer;
-    use super::sampling;
+    use super::post_thinking_sampling;
     use super::template_choices;
     use super::tools;
 
@@ -2415,7 +2736,8 @@ mod tests
         }
         let cache = chat_request(&body, DEFAULTS, FreshSeed(0))
             .unwrap()
-            .request
+            .prepared
+            .unwrap()
             .prompt
             .cache;
         assert_eq!(
@@ -2472,7 +2794,8 @@ mod tests
             }
             let parsed = chat_request(&body, defaults, FreshSeed(0)).unwrap();
             assert_eq!(
-                parsed.request.generation.thinking_budget, expected,
+                parsed.prepared.unwrap().generation.thinking_budget,
+                expected,
                 "{case}"
             );
         }
@@ -2591,25 +2914,61 @@ mod tests
     fn sampling_ranges_are_inclusive()
     {
         let edges = json!({"temperature": 2.0_f64, "top_p": 0.0_f64, "top_k": 20_i32, "min_p": 1.0_f64, "presence_penalty": -2.0_f64});
-        let phase = sampling(edges.as_object().unwrap(), Phase::Initial).unwrap();
+        let initial = initial_sampling(edges.as_object().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            phase.temperature,
+            initial.temperature,
             Setting::Set(2.0_f32),
             "temperature 2 is in range"
         );
-        assert_eq!(phase.top_k, Setting::Set(20_i32), "top_k 20 is in range");
-        for outside in [
-            json!({"temperature": 2.001_f64}),
-            json!({"top_k": 21_i32}),
-            json!({"top_p": -0.001_f64}),
+        assert_eq!(initial.top_k, Setting::Set(20_i32), "top_k 20 is in range");
+        let narrowing = json!({"temperature": 2.000_000_000_1_f64});
+        assert!(
+            initial_sampling(narrowing.as_object().unwrap())
+                .unwrap()
+                .is_ok(),
+            "a value that narrows onto the bound is in range, as ninfer checks the f32"
+        );
+        for (outside, message) in [
+            (
+                json!({"temperature": 2.001_f64}),
+                "temperature must be in [0,2]",
+            ),
+            (json!({"top_k": 21_i32}), "top_k must be in [0,20]"),
+            (json!({"top_p": -0.001_f64}), "top_p must be in [0,1]"),
+            (
+                json!({"presence_penalty": 1e39_f64}),
+                "sampling parameters must be finite",
+            ),
         ] {
-            let refused = sampling(outside.as_object().unwrap(), Phase::Initial).unwrap_err();
+            let refused = initial_sampling(outside.as_object().unwrap())
+                .unwrap()
+                .unwrap_err();
             assert_eq!(
-                refused.status.as_u16(),
-                400_u16,
-                "{outside} is out of range"
+                refused.message, message,
+                "{outside} is refused while preparing"
             );
         }
+        let mistyped = json!({"temperature": "hot"});
+        assert!(
+            initial_sampling(mistyped.as_object().unwrap()).is_err(),
+            "a mistyped value is refused while parsing"
+        );
+        let after = post_thinking_sampling(edges.as_object().unwrap()).unwrap();
+        assert_eq!(
+            after.top_k,
+            Setting::Set(20_i32),
+            "the same edges hold after thinking"
+        );
+        let beyond = json!({"temperature": 2.001_f64});
+        assert_eq!(
+            post_thinking_sampling(beyond.as_object().unwrap())
+                .unwrap_err()
+                .message,
+            "post_thinking.temperature is out of range",
+            "after thinking, the range is checked while parsing"
+        );
     }
 
     #[test]
@@ -2638,8 +2997,9 @@ mod tests
     fn template_choices_merge_and_leave_the_arguments()
     {
         let body = json!({"chat_template_kwargs": {"x": 1_i32, "enable_thinking": true, "a": 2_i32}, "reasoning_effort": "low"});
-        let (thinking, preserve, effort, arguments) =
-            template_choices(body.as_object().unwrap()).unwrap();
+        let (thinking, preserve, effort, arguments) = template_choices(body.as_object().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             thinking,
             Switch::On,
@@ -2658,6 +3018,7 @@ mod tests
         let conflict = json!({"enable_thinking": false, "reasoning_effort": "high"});
         assert_eq!(
             template_choices(conflict.as_object().unwrap())
+                .unwrap()
                 .unwrap_err()
                 .code,
             "conflicting_template_option",
@@ -2665,7 +3026,10 @@ mod tests
         );
         let none = json!({});
         assert_eq!(
-            template_choices(none.as_object().unwrap()).unwrap().3,
+            template_choices(none.as_object().unwrap())
+                .unwrap()
+                .unwrap()
+                .3,
             "{}",
             "no arguments serialize as an empty object"
         );
@@ -2716,7 +3080,7 @@ mod tests
             Usage::Included,
             "include_usage is carried"
         );
-        let request = parsed.request;
+        let request = parsed.prepared.unwrap();
         assert_eq!(
             request.generation.output_tokens,
             TokenCount::from(32_u32),
@@ -2762,14 +3126,92 @@ mod tests
         );
         let withheld = json!({"model": "m", "tool_choice": "none", "tools": [{"type": "function", "function": {"name": "ls"}}], "messages": [{"role": "user", "content": "u"}]});
         let parsed = chat_request(&withheld, DEFAULTS, FreshSeed(0)).unwrap();
+        assert_eq!(
+            parsed.counts.tools,
+            crate::pretty::Count(1),
+            "the log counts the declared tool, as ninfer's does"
+        );
+        let request = parsed.prepared.unwrap();
         assert!(
-            parsed.request.prompt.tools.is_empty(),
+            request.prompt.tools.is_empty(),
             "tool_choice none withholds the tools"
         );
         assert_eq!(
-            parsed.request.generation.special_tokens,
+            request.generation.special_tokens,
             SpecialTokens::Trimmed,
             "withheld tools trim special tokens"
+        );
+    }
+
+    #[test]
+    fn preparation_refuses_in_ninfers_order()
+    {
+        let parse = |extra: serde_json::Value, content: serde_json::Value| {
+            let mut body =
+                json!({"model": "m", "messages": [{"role": "user", "content": content}]});
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            return chat_request(&body, DEFAULTS, FreshSeed(0));
+        };
+        let image = json!([{"type": "image_url", "image_url": {"url": "http://x"}}]);
+        let hot = json!({"temperature": 3_i32});
+        assert_eq!(
+            parse(json!({"temperature": 3_i32, "n": 2_i32}), json!("u"))
+                .unwrap_err()
+                .param,
+            "n",
+            "a parsing refusal wins over a later preparing one"
+        );
+        let refused = parse(hot.clone(), json!("u")).unwrap();
+        assert_eq!(
+            (refused.prepared.unwrap_err().param, refused.counts.messages),
+            (String::from("temperature"), crate::pretty::Count(1)),
+            "a range is refused while preparing"
+        );
+        let pictured = parse(json!({}), image.clone()).unwrap();
+        assert_eq!(
+            (pictured.prepared.unwrap_err().code, pictured.counts.media),
+            (String::from("vision_disabled"), crate::pretty::Count(1)),
+            "an image is counted, then refused while preparing"
+        );
+        assert_eq!(
+            parse(hot, image.clone())
+                .unwrap()
+                .prepared
+                .unwrap_err()
+                .param,
+            "temperature",
+            "sampling is checked before media"
+        );
+        assert_eq!(
+            parse(
+                json!({"enable_thinking": false, "reasoning_effort": "high", "temperature": 3_i32}),
+                json!("u")
+            )
+            .unwrap()
+            .prepared
+            .unwrap_err()
+            .code,
+            "conflicting_template_option",
+            "the template is resolved before sampling"
+        );
+        let unreachable = json!([{"type": "image_url", "image_url": "ftp://x"}]);
+        assert_eq!(
+            parse(json!({}), unreachable).unwrap_err().message,
+            "image_url must use HTTP(S) or a data URI",
+            "a malformed image is refused while parsing"
+        );
+        let answered = json!({"model": "m", "messages": [
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": image}
+        ]});
+        assert_eq!(
+            chat_request(&answered, DEFAULTS, FreshSeed(0))
+                .unwrap_err()
+                .code,
+            "modality_not_supported",
+            "an image off a user or tool turn is refused while parsing"
         );
     }
 }

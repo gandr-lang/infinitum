@@ -3,6 +3,7 @@
 #include "infinitum-ninfer/src/bridge.rs.h"
 #include "ninfer/round_control.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -310,6 +311,21 @@ std::optional<::ninfer::ReasoningEffort> to_effort(EffortLevel value) noexcept {
     }
 }
 
+/// Read where a reused prefix came from.
+///
+/// # Specification
+/// trivial.
+ReuseSource to_reuse(::ninfer::PrefixReusePath path) noexcept {
+    switch (path) {
+    case ::ninfer::PrefixReusePath::PrivateEndpoint: return ReuseSource::PrivateEndpoint;
+    case ::ninfer::PrefixReusePath::PrivateTurnClosure: return ReuseSource::TurnClosure;
+    case ::ninfer::PrefixReusePath::PrivateResponseReplay: return ReuseSource::ResponseReplay;
+    case ::ninfer::PrefixReusePath::PrivateLongAnchor: return ReuseSource::LongAnchor;
+    case ::ninfer::PrefixReusePath::SharedStablePrefix: return ReuseSource::SharedPrefix;
+    default: return ReuseSource::Root;
+    }
+}
+
 /// Read a KV storage.
 ///
 /// # Specification
@@ -466,6 +482,91 @@ std::optional<::ninfer::ReasoningEffort> to_effort(EffortLevel value) noexcept {
     return request;
 }
 
+/// Name a KV storage back in the bridge's terms.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: the inverse of `to_storage` on the five storages.
+/// - provides: the capacity record's storage.
+/// - fails: never.
+/// - panics: none.
+KvStorage from_storage(::ninfer::KvCacheStorage storage) noexcept {
+    switch (storage) {
+    case ::ninfer::KvCacheStorage::Int8Group64: return KvStorage::Int8;
+    case ::ninfer::KvCacheStorage::Fp8E4M3Row256: return KvStorage::Fp8;
+    case ::ninfer::KvCacheStorage::Nvfp4Group16: return KvStorage::Nvfp4;
+    case ::ninfer::KvCacheStorage::Fp8KeyNvfp4Value: return KvStorage::Fp8KeyNvfp4Value;
+    default: return KvStorage::BFloat16;
+    }
+}
+
+/// Digest the runtime statistics ninfer's server compares for activity beyond the token totals,
+/// decode rounds and request gauges the counter record carries.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: FNV-1a over the fields `report_has_activity` compares between snapshots, so two
+///   snapshots that differ in any of them differ in digest but for a 2^-64 collision.
+/// - provides: the counter record's digest.
+/// - fails: never.
+/// - panics: none.
+std::uint64_t activity_digest(const ::ninfer::RuntimeStats& stats) noexcept {
+    const ::ninfer::RuntimeHostWorkStats& host = stats.host_work;
+    const std::uint64_t fields[]               = {
+        stats.active_captures_completed,
+        stats.active_captures_aborted,
+        stats.root_selections,
+        stats.private_endpoint_selections,
+        stats.private_turn_closure_selections,
+        stats.private_response_replay_selections,
+        stats.private_long_anchor_selections,
+        stats.shared_stable_prefix_selections,
+        stats.state_moves,
+        stats.state_forks,
+        stats.state_restores,
+        stats.state_d2h_count,
+        stats.state_h2d_count,
+        stats.state_d2d_count,
+        stats.main_kv_d2h_pages,
+        stats.main_kv_h2d_pages,
+        stats.main_kv_d2d_pages,
+        stats.backend_kv_d2h_pages,
+        stats.backend_kv_h2d_pages,
+        stats.backend_kv_d2d_pages,
+        stats.pressure_spill_pages,
+        stats.partial_tail_cow_pages,
+        stats.pressure_private_owners_degraded,
+        stats.pressure_private_owners_evicted,
+        stats.pressure_shared_owners_degraded,
+        stats.pressure_shared_owners_evicted,
+        stats.pressure_checkpoints_dropped,
+        stats.pressure_searches,
+        stats.pressure_search_budget_exhaustions,
+        stats.pressure_maximal_fallback_selections,
+        stats.historical_fork_hits,
+        stats.device_state_occupied_slots,
+        stats.host_state_occupied_slots,
+        stats.device_main_kv_occupied_pages,
+        stats.device_backend_kv_occupied_pages,
+        static_cast<std::uint64_t>(stats.host_kv_occupied_bytes),
+        static_cast<std::uint64_t>(stats.shared_active_references),
+        host.engine_boundary_ns,
+        host.program_submit_ns,
+        host.program_post_ns,
+        host.engine_commit_output_ns,
+        host.engine_maintenance_ns,
+        host.device_wait_ns,
+    };
+    std::uint64_t digest = 0xcbf29ce484222325ULL;
+    for (const std::uint64_t field : fields) {
+        for (int shift = 0; shift < 64; shift += 8) {
+            digest ^= (field >> shift) & 0xffULL;
+            digest *= 0x100000001b3ULL;
+        }
+    }
+    return digest;
+}
+
 } // namespace
 
 Session::Session(::ninfer::Engine engine_) noexcept : engine(std::move(engine_)) {}
@@ -555,9 +656,63 @@ void detokenize(const Session& session, rust::Slice<const std::int32_t> ids,
     } catch (...) { fail(outcome); }
 }
 
-void model_name(const Session& session, rust::String& name, Outcome& outcome) noexcept {
+void load_summary(const Session& session, LoadRecord& record, Outcome& outcome) noexcept {
     try {
-        name = rust::String::lossy(session.engine.load_summary().model_name);
+        const ::ninfer::LoadSummary load = session.engine.load_summary();
+        record.model_name                = rust::String::lossy(load.model_name);
+        record.cuda_sync                 = rust::String::lossy(load.cuda_sync_mode);
+        record.weights_bytes             = load.host_to_device_bytes;
+        succeed(outcome);
+    } catch (...) { fail(outcome); }
+}
+
+void capacity(const Session& session, CapacityRecord& record, Outcome& outcome) noexcept {
+    try {
+        const ::ninfer::MemorySummary memory     = session.engine.memory_summary();
+        const ::ninfer::EngineOptions& options   = session.engine.options();
+        const ::ninfer::ContextCacheOptions& cache = options.context_cache;
+        record.kv_tokens     = memory.kv_capacity;
+        record.kv_storage    = from_storage(memory.kv_cache);
+        record.kv_sizing     = memory.kv_capacity_mode == ::ninfer::KvCapacityMode::Automatic
+                                   ? KvSizing::Automatic
+                                   : KvSizing::Explicit;
+        record.pages         = memory.kv_capacity_page_groups;
+        record.max_pages     = memory.kv_capacity_max_page_groups;
+        record.runtime_bytes = memory.runtime_reservation_bytes;
+        record.free_bytes    = memory.available_after_startup_bytes;
+        record.cache_enabled = cache.enabled;
+        if (cache.enabled) {
+            record.lanes                 = options.max_concurrency;
+            record.device_states         = cache.device_state_slots.value();
+            record.host_states           = cache.host_state_slots;
+            record.host_kv_bytes         = cache.host_kv_capacity_bytes;
+            record.private_continuations = cache.max_private_continuations.value();
+            record.shared_prefixes       = cache.max_shared_prefixes.value();
+            record.long_anchors          = cache.max_long_anchors_per_continuation.value();
+        }
+        succeed(outcome);
+    } catch (...) { fail(outcome); }
+}
+
+void counters(const Session& session, CounterRecord& record, Outcome& outcome) noexcept {
+    try {
+        const ::ninfer::RuntimeStats stats        = session.engine.runtime_stats();
+        const ::ninfer::RuntimeHostWorkStats& host = stats.host_work;
+        record.prefill_tokens   = stats.computed_prefill_tokens;
+        record.decode_tokens    = stats.committed_decode_tokens;
+        record.decode_rounds    = stats.decode_rounds;
+        record.decode_rows      = stats.decode_row_rounds;
+        record.running          = stats.running_requests;
+        record.prefilling       = stats.prefilling_requests;
+        record.decode_ready     = stats.decode_ready_requests;
+        record.waiting          = stats.waiting_requests;
+        record.materializing    = stats.materializing_requests;
+        record.capture_pending  = stats.capture_pending_requests;
+        record.terminal_pending = stats.terminal_pending_requests;
+        record.host_active_ns   = host.engine_boundary_ns + host.program_submit_ns +
+                                host.program_post_ns + host.engine_commit_output_ns +
+                                host.engine_maintenance_ns;
+        record.digest = activity_digest(stats);
         succeed(outcome);
     } catch (...) { fail(outcome); }
 }
@@ -566,6 +721,7 @@ void run_chat(const Session& session, const ChatPrompt& prompt, const ChatSettin
               ChatSink& sink, const CancelFlag& cancel, ReviewSink& review, ChatRecord& record,
               Outcome& outcome) noexcept {
     try {
+        const auto arrived    = std::chrono::steady_clock::now();
         auto controller = std::make_shared<Controller>(review);
         const Detach detach(*controller);
         const ::ninfer::CancellationView cancellation(
@@ -579,8 +735,12 @@ void run_chat(const Session& session, const ChatPrompt& prompt, const ChatSettin
                                                    .deadline     = deadline,
                                                    .cancellation = cancellation,
                                                });
+        const double prepare_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - arrived).count();
         // ninfer's server drops the budget when the rendered turn does not open in thinking.
-        if (!prepared.summary().starts_in_reasoning) { request.execution.thinking.budget.reset(); }
+        const bool thinking_open = prepared.summary().starts_in_reasoning;
+        if (!thinking_open) { request.execution.thinking.budget.reset(); }
+        const std::uint32_t thinking_budget = request.execution.thinking.budget.value_or(0);
         ::ninfer::GenerationObservationOptions observation;
         observation.phase_timings = true;
         auto handle = session.engine.submit(std::move(prepared), std::move(request),
@@ -589,7 +749,7 @@ void run_chat(const Session& session, const ChatPrompt& prompt, const ChatSettin
                                                 : ::ninfer::OutputConsumerMode::Aggregate,
                                             observation, deadline, controller);
         EventForwarder forwarder(sink);
-        if (settings.streaming) { chat_submitted(sink); }
+        chat_submitted(sink, thinking_open, thinking_budget);
         auto result = handle.wait(settings.streaming ? &forwarder : nullptr, cancellation);
         record.content   = rust::String::lossy(result.content);
         record.reasoning = rust::String::lossy(result.reasoning);
@@ -611,6 +771,25 @@ void run_chat(const Session& session, const ChatPrompt& prompt, const ChatSettin
         record.generation_wall_ns = nanoseconds(result.timings.generation_wall_seconds);
         record.drafted            = result.speculative.drafted_tokens;
         record.accepted           = result.speculative.accepted_tokens;
+        // ninfer's server times the first token and the end from the request's arrival: its own
+        // preparation, then the Engine's timings past the Engine's preparation.
+        record.first_token_ns = nanoseconds(
+            prepare_seconds +
+            std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds));
+        record.total_ns = nanoseconds(
+            prepare_seconds +
+            std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds));
+        record.prefill_ns    = nanoseconds(result.timings.prefill_seconds);
+        record.decode_ns     = nanoseconds(result.timings.decode_seconds);
+        record.queue_wait_ns = nanoseconds(result.engine_timing.queue_wait_seconds);
+        record.reuse         = to_reuse(result.prefix_reuse_path);
+        record.thinking_budget          = result.thinking.configured_budget.value_or(0);
+        record.thinking_model_tokens    = result.thinking.model_thinking_tokens;
+        record.thinking_injected_tokens = result.thinking.injected_tokens;
+        record.accepted_per_position.clear();
+        for (const auto accepted : result.speculative.accepted_per_position) {
+            record.accepted_per_position.push_back(accepted);
+        }
         succeed(outcome);
     } catch (...) { fail(outcome); }
 }

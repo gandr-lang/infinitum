@@ -3,6 +3,8 @@
 use infinitum_round::TokenCount;
 use infinitum_round::TokenId;
 
+use crate::request::ThinkingBudget;
+
 /// The output channel a text delta belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel
@@ -56,6 +58,58 @@ pub struct Admission
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Tally(pub u64);
 
+/// Where an admitted prompt's reused prefix came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReusePath
+{
+    /// Nothing cached matched; the prompt prefilled from the root.
+    Root,
+    /// The end of a private continuation.
+    PrivateEndpoint,
+    /// A private continuation's closed turn.
+    TurnClosure,
+    /// A replayed private response.
+    ResponseReplay,
+    /// A private long anchor.
+    LongAnchor,
+    /// A shared stable prefix.
+    SharedPrefix,
+}
+
+/// A thinking budget and what the model spent of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThinkingSpend
+{
+    /// The budget the request ran under.
+    pub budget: ThinkingBudget,
+    /// Model tokens accepted while budgeted thinking stayed open.
+    pub model_tokens: TokenCount,
+    /// Control tokens the backend injected to close thinking.
+    pub injected_tokens: TokenCount,
+}
+
+/// How one request ran, for the operational log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Telemetry
+{
+    /// From the request's arrival to its first output token.
+    pub first_token: core::time::Duration,
+    /// From the request's arrival to its end.
+    pub total: core::time::Duration,
+    /// Prefill execution time.
+    pub prefill: core::time::Duration,
+    /// Decode execution time.
+    pub decode: core::time::Duration,
+    /// Time spent waiting for admission.
+    pub queue_wait: core::time::Duration,
+    /// Where the reused prefix came from.
+    pub reuse: ReusePath,
+    /// The thinking budget and its spend.
+    pub thinking: ThinkingSpend,
+    /// Drafted tokens accepted at each draft position, first position first.
+    pub accepted_per_position: Vec<Tally>,
+}
+
 /// What one request produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatOutcome
@@ -82,4 +136,6 @@ pub struct ChatOutcome
     pub drafted: Tally,
     /// Drafted tokens accepted.
     pub accepted: Tally,
+    /// How the request ran.
+    pub telemetry: Telemetry,
 }
