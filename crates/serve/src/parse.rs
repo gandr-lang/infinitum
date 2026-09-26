@@ -1946,7 +1946,10 @@ pub fn chat_request(
         && count != Integer(1_i32)
     {
         return Err(ApiError::invalid(
-            String::from("only n=1 is supported"),
+            String::from(
+                "n requests multiple completions, while NInfer produces one completion per \
+                 request; only n=1 is supported",
+            ),
             Param("n"),
             Code("n_not_supported"),
         ));
