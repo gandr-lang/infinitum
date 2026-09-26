@@ -30,11 +30,13 @@
 ///   is gone when it returns, and reaches the `CancelFlag`, an atomic flag
 ///   readable from any thread, only through cancellation views that end with
 ///   the calls they are passed to; `open_session` reaches the `StartupSink`
-///   only through a relay whose pointer to it is cleared under a mutex before
-///   it returns, so the observer the Engine keeps in its options never reaches
-///   the sink after its borrow ends; `Session` is used only through the
-///   `UniquePtr` `open_session` returns, and only when that pointer is
-///   non-null.
+///   only from the thread that called it, because ninfer publishes each startup
+///   report synchronously from the Engine's constructor, which `open_session`
+///   runs inline, and only through a relay whose pointer to it is cleared under
+///   a mutex before it returns, so the observer the Engine keeps in its options
+///   never reaches the sink after its borrow ends; `Session` is used only
+///   through the `UniquePtr` `open_session` returns, and only when that pointer
+///   is non-null.
 #[cxx::bridge(namespace = "infinitum::ninfer")]
 pub mod ffi
 {

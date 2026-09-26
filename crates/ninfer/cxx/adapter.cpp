@@ -261,7 +261,9 @@ public:
     /// Forward one report.
     ///
     /// # Specification
-    /// - requires: nothing.
+    /// - requires: called on the thread running `open_session`. ninfer publishes each startup
+    ///   report synchronously, on the thread constructing the Engine (`StartupPhaseScope` in
+    ///   `core/startup.h`; no worker thread reports), and `open_session` constructs it inline.
     /// - ensures: while attached, a report whose phase and status the bridge names reached the
     ///   sink, its counts marked as bytes when ninfer counts bytes; once detached, nothing is
     ///   forwarded.
