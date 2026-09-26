@@ -824,6 +824,32 @@ impl ChatEvents for Logged<'_>
     {
         self.inner.publish(channel, text);
     }
+
+    /// Forward.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn progress(
+        &mut self,
+        progress: infinitum_chat::PromptProgress,
+    )
+    {
+        self.inner.progress(progress);
+    }
+
+    /// Forward.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn timing(
+        &mut self,
+        timing: infinitum_chat::TimingObservation,
+    )
+    {
+        self.inner.timing(timing);
+    }
 }
 
 /// The startup capacity lines.

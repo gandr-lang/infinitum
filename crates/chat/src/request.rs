@@ -293,6 +293,45 @@ pub enum Delivery
     Streaming,
 }
 
+/// Whether a streamed request reports cumulative timings at each commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LiveTimings
+{
+    /// Timings arrive with the outcome only.
+    Withheld,
+    /// A timing observation at every output commit.
+    PerCommit,
+}
+
+/// Whether a streamed request reports prefill progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProgressReports
+{
+    /// No progress reports.
+    Withheld,
+    /// Progress as prefill completes work.
+    Published,
+}
+
+/// What a streamed request reports beside its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Observations
+{
+    /// Live timings.
+    pub timings: LiveTimings,
+    /// Prefill progress.
+    pub progress: ProgressReports,
+}
+
+impl Observations
+{
+    /// Nothing beyond the text.
+    pub const NONE: Self = Self {
+        timings: LiveTimings::Withheld,
+        progress: ProgressReports::Withheld,
+    };
+}
+
 /// How to generate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Generation
@@ -332,4 +371,7 @@ pub struct ChatRequest
     pub generation: Generation,
     /// How output is delivered.
     pub delivery: Delivery,
+    /// What a streamed request reports beside its text; an aggregate request
+    /// reports nothing.
+    pub observations: Observations,
 }

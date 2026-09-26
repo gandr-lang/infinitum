@@ -30,10 +30,13 @@ use infinitum_chat::FailureKind;
 use infinitum_chat::Finish;
 use infinitum_chat::GeneratedToolCall;
 use infinitum_chat::KvSizing;
+use infinitum_chat::LiveTimings;
 use infinitum_chat::LoadReport;
 use infinitum_chat::Marked;
 use infinitum_chat::ModelName;
 use infinitum_chat::PrefixReuse;
+use infinitum_chat::ProgressReports;
+use infinitum_chat::PromptProgress;
 use infinitum_chat::RequestGauges;
 use infinitum_chat::ReusePath;
 use infinitum_chat::Role;
@@ -51,6 +54,7 @@ use infinitum_chat::Telemetry;
 use infinitum_chat::Thinking;
 use infinitum_chat::ThinkingBudget;
 use infinitum_chat::ThinkingSpend;
+use infinitum_chat::TimingObservation;
 use infinitum_round::Maybe;
 use infinitum_round::TokenCount;
 use infinitum_round::TokenId;
@@ -157,6 +161,56 @@ pub fn chat_publish(
     };
     sink.events
         .publish(channel, DeltaText(&String::from_utf8_lossy(text)));
+}
+
+/// Forward prefill's progress to the consumer.
+///
+/// # Specification
+/// - requires: the request asked for progress reports.
+/// - ensures: the consumer received the counts and the elapsed time.
+/// - provides: the bridge's entry for `OutputSink::progress`.
+/// - fails: never.
+/// - panics: none.
+// The `cxx` border: the counts and nanoseconds are wrapped on the first line
+// past it.
+pub fn chat_progress(
+    sink: &mut ChatSink<'_>,
+    total: u32,
+    reused: u32,
+    processed: u32,
+    elapsed_ns: u64,
+)
+{
+    sink.events.progress(PromptProgress {
+        total: TokenCount::from(total),
+        reused: TokenCount::from(reused),
+        processed: TokenCount::from(processed),
+        elapsed: core::time::Duration::from_nanos(elapsed_ns),
+    });
+}
+
+/// Forward one commit's cumulative timings to the consumer.
+///
+/// # Specification
+/// - requires: the request asked for live timings.
+/// - ensures: the consumer received the count and both times.
+/// - provides: the bridge's entry for `OutputSink::timing`.
+/// - fails: never.
+/// - panics: none.
+// The `cxx` border: the count and nanoseconds are wrapped on the first line
+// past it.
+pub fn chat_timing(
+    sink: &mut ChatSink<'_>,
+    generated: u32,
+    prompt_ns: u64,
+    generation_ns: u64,
+)
+{
+    sink.events.timing(TimingObservation {
+        generated: TokenCount::from(generated),
+        prompt_elapsed: core::time::Duration::from_nanos(prompt_ns),
+        generation_elapsed: core::time::Duration::from_nanos(generation_ns),
+    });
 }
 
 /// Whether the consumer asked to stop.
@@ -347,8 +401,8 @@ fn lower_mark(marker: &CacheMarker) -> ffi::CacheMark
 /// # Specification
 /// - requires: nothing.
 /// - ensures: the wire settings carry every setting of `request`; an unlimited
-///   thinking budget is zero, and an inherited post-thinking seed leaves its
-///   flag lowered.
+///   thinking budget is zero, an inherited post-thinking seed leaves its flag
+///   lowered, and the observations are raised only for a streamed request.
 /// - provides: the adapter's `RequestOptions` source.
 /// - fails: never.
 /// - panics: none.
@@ -376,6 +430,10 @@ fn lower_settings(request: &ChatRequest) -> ffi::ChatSettings
         tool_name_limit: generation.tool_name_limit.get(),
         prefix_reuse: generation.prefix_reuse == PrefixReuse::ReadWrite,
         streaming: request.delivery == Delivery::Streaming,
+        live_timings: request.delivery == Delivery::Streaming
+            && request.observations.timings == LiveTimings::PerCommit,
+        prompt_progress: request.delivery == Delivery::Streaming
+            && request.observations.progress == ProgressReports::Published,
     };
 }
 

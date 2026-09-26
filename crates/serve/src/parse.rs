@@ -15,9 +15,12 @@ use infinitum_chat::Delivery;
 use infinitum_chat::Effort;
 use infinitum_chat::Generation;
 use infinitum_chat::InstructionBytes;
+use infinitum_chat::LiveTimings;
 use infinitum_chat::Marked;
 use infinitum_chat::Message;
+use infinitum_chat::Observations;
 use infinitum_chat::PrefixReuse;
+use infinitum_chat::ProgressReports;
 use infinitum_chat::Prompt;
 use infinitum_chat::PromptCache;
 use infinitum_chat::Role;
@@ -389,8 +392,7 @@ fn function_name(
 ///   `function_call`, `logit_bias`, `logprobs`, `top_logprobs`,
 ///   `response_format`, `modalities`, `web_search_options`, `moderation`,
 ///   `verbosity`, `store`, constrained-decoding extensions,
-///   `repetition_penalty`, `mm_processor_kwargs`, and the live-observation
-///   extensions this surface does not publish.
+///   `repetition_penalty` and `mm_processor_kwargs`.
 /// - fails: on the first non-neutral control, with ninfer's parameter and code.
 /// - panics: none.
 ///
@@ -609,15 +611,6 @@ fn refuse_unsupported(body: &Object) -> Result<(), ApiError>
                 ),
                 Param("mm_processor_kwargs"),
                 Code("mm_processor_kwargs_not_supported"),
-            ));
-        }
-    }
-    for key in ["timings_per_token", "return_progress"] {
-        if boolean(body, Key(key))? == Flag::True {
-            return Err(ApiError::invalid(
-                format!("{key} live observations are not published"),
-                Param(key),
-                Code("observation_not_supported"),
             ));
         }
     }
@@ -2461,7 +2454,8 @@ fn prepare(
 ///   template arguments and choices, output limit, sampling for both phases,
 ///   seeds, stops, special-token handling and tool-name limit, the default
 ///   thinking budget applying unless thinking is turned off, by
-///   `enable_thinking` or by effort `none`.
+///   `enable_thinking` or by effort `none`, and `timings_per_token` and
+///   `return_progress` observed only on a stream.
 /// - provides: the chat surface's request translation.
 /// - fails: with ninfer's parameter and code for every body it refuses, at the
 ///   stage it refuses it.
@@ -2476,6 +2470,7 @@ fn prepare(
 ///   `ninfer-serve` checks rendering end to end.
 /// - witness: `tests::a_tool_turn_translates_whole`
 /// - witness: `tests::preparation_refuses_in_ninfers_order`
+/// - witness: `tests::observations_apply_only_to_a_stream`
 #[inline]
 pub fn chat_request(
     body: &Value,
@@ -2597,6 +2592,24 @@ pub fn chat_request(
             ));
         },
     };
+    // ninfer reads both on every request and observes them only on a stream.
+    let timings_per_token = boolean(body, Key("timings_per_token"))?;
+    let return_progress = boolean(body, Key("return_progress"))?;
+    let streamed = delivery == Delivery::Streaming;
+    let observations = Observations {
+        timings: if streamed && timings_per_token == Flag::True {
+            LiveTimings::PerCommit
+        }
+        else {
+            LiveTimings::Withheld
+        },
+        progress: if streamed && return_progress == Flag::True {
+            ProgressReports::Published
+        }
+        else {
+            ProgressReports::Withheld
+        },
+    };
     let output_tokens = output_tokens(body, defaults)?;
     let template = template_choices(body)?;
     let offered = tool_use == ToolUse::Auto && !declared.is_empty();
@@ -2665,6 +2678,7 @@ pub fn chat_request(
                 prefix_reuse: PrefixReuse::ReadWrite,
             },
             delivery,
+            observations,
         };
     });
     return Ok(ParsedChat {
@@ -2687,7 +2701,10 @@ mod tests
     use infinitum_chat::Delivery;
     use infinitum_chat::Effort;
     use infinitum_chat::InstructionBytes;
+    use infinitum_chat::LiveTimings;
     use infinitum_chat::Marked;
+    use infinitum_chat::Observations;
+    use infinitum_chat::ProgressReports;
     use infinitum_chat::Role;
     use infinitum_chat::Setting;
     use infinitum_chat::SpecialTokens;
@@ -3212,6 +3229,40 @@ mod tests
                 .code,
             "modality_not_supported",
             "an image off a user or tool turn is refused while parsing"
+        );
+    }
+
+    #[test]
+    fn observations_apply_only_to_a_stream()
+    {
+        let observed = |stream: bool| {
+            let body = json!({"model": "m", "stream": stream, "timings_per_token": true, "return_progress": true, "messages": [{"role": "user", "content": "u"}]});
+            return chat_request(&body, DEFAULTS, FreshSeed(0))
+                .unwrap()
+                .prepared
+                .unwrap()
+                .observations;
+        };
+        assert_eq!(
+            observed(true),
+            Observations {
+                timings: LiveTimings::PerCommit,
+                progress: ProgressReports::Published,
+            },
+            "a stream observes both"
+        );
+        assert_eq!(
+            observed(false),
+            Observations::NONE,
+            "an aggregate response observes neither"
+        );
+        let malformed = json!({"model": "m", "return_progress": 1_i32, "messages": [{"role": "user", "content": "u"}]});
+        assert_eq!(
+            chat_request(&malformed, DEFAULTS, FreshSeed(0))
+                .unwrap_err()
+                .message,
+            "return_progress must be a boolean",
+            "a non-boolean is refused while parsing, stream or not"
         );
     }
 }
