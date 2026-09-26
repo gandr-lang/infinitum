@@ -18,6 +18,8 @@ use crate::bridge::ffi;
 use crate::options::ChatTemplate;
 use crate::options::CudaGraph;
 use crate::options::EngineOptions;
+use crate::options::KvCapacity;
+use crate::options::KvStorage;
 use crate::plan::DFlash2Plan;
 use crate::text::RawText;
 use crate::text::RenderedBytes;
@@ -568,6 +570,22 @@ impl Session
             artifact: String::from(artifact),
             device: i32::from(options.device()),
             max_context: core::num::NonZeroU32::from(options.context()).get(),
+            kv_sizing: match options.kv_capacity() {
+                | KvCapacity::Tokens(_) => ffi::KvSizing::Explicit,
+                | KvCapacity::Automatic => ffi::KvSizing::Automatic,
+            },
+            kv_capacity: match options.kv_capacity() {
+                | KvCapacity::Tokens(tokens) => tokens.get(),
+                | KvCapacity::Automatic => 0,
+            },
+            kv_storage: match options.kv_storage() {
+                | KvStorage::BFloat16 => ffi::KvStorage::BFloat16,
+                | KvStorage::Int8 => ffi::KvStorage::Int8,
+                | KvStorage::Fp8 => ffi::KvStorage::Fp8,
+                | KvStorage::Nvfp4 => ffi::KvStorage::Nvfp4,
+                | KvStorage::Fp8KeyNvfp4Value => ffi::KvStorage::Fp8KeyNvfp4Value,
+            },
+            prefill_chunk: core::num::NonZeroU32::from(options.prefill_chunk()).get(),
             pending_timeout_ms: core::num::NonZeroU32::from(options.pending_timeout()).get(),
             draft_width: core::num::NonZeroU32::from(plan.width()).get(),
             cuda_graph: match options.cuda_graph() {

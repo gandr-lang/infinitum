@@ -96,6 +96,32 @@ pub mod ffi
         On,
     }
 
+    /// How the adapter sizes the Main KV cache.
+    #[derive(Debug)]
+    enum KvSizing
+    {
+        /// `kv_capacity` tokens.
+        Explicit,
+        /// From device memory, with ninfer's default headroom.
+        Automatic,
+    }
+
+    /// The KV storage, as the adapter reads it.
+    #[derive(Debug)]
+    enum KvStorage
+    {
+        /// bfloat16.
+        BFloat16,
+        /// 8-bit integers in groups of 64.
+        Int8,
+        /// FP8 E4M3 rows of 256.
+        Fp8,
+        /// NVFP4 groups of 16.
+        Nvfp4,
+        /// FP8 keys, NVFP4 values.
+        Fp8KeyNvfp4Value,
+    }
+
     /// The Engine options the adapter sets; every other option keeps ninfer's
     /// default.
     #[derive(Debug)]
@@ -105,8 +131,17 @@ pub mod ffi
         artifact: String,
         /// The CUDA device ordinal.
         device: i32,
-        /// The context ceiling, which also sizes the KV cache.
+        /// The context ceiling.
         max_context: u32,
+        /// How the Main KV cache is sized.
+        kv_sizing: KvSizing,
+        /// The Main KV capacity in tokens when sized explicitly; zero when
+        /// automatic.
+        kv_capacity: u32,
+        /// The KV storage.
+        kv_storage: KvStorage,
+        /// Prompt tokens per prefill step.
+        prefill_chunk: u32,
         /// How long a request may wait for admission, in milliseconds.
         pending_timeout_ms: u32,
         /// DFlash2's draft width `K`.
