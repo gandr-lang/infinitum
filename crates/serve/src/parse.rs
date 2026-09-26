@@ -187,6 +187,32 @@ fn boolean(
     };
 }
 
+/// An optional template switch.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: as [`boolean`], with ninfer's message for the switches it reads
+///   as optional.
+/// - provides: `enable_thinking` and `preserve_thinking`, typed and nested.
+/// - fails: when present and not a boolean.
+/// - panics: none.
+///
+/// # Errors
+/// - [`ApiError`]: `"<key> must be a boolean or null"` naming `key`.
+fn nullable_boolean(
+    object: &Object,
+    key: Key<'_>,
+) -> Result<Flag, ApiError>
+{
+    return boolean(object, key).map_err(|_mistyped| {
+        return ApiError::invalid(
+            format!("{} must be a boolean or null", key.0),
+            Param(key.0),
+            Code::NONE,
+        );
+    });
+}
+
 /// An optional number.
 ///
 /// # Specification
@@ -1656,7 +1682,7 @@ enum Unnamed
 /// - panics: none.
 ///
 /// # Errors
-/// - [`ApiError`]: code `invalid_template_option` or
+/// - [`ApiError`]: [`nullable_boolean`]'s, or code
 ///   `conflicting_template_option`, naming `key`.
 fn merge_switch(
     kwargs: &mut Object,
@@ -1664,20 +1690,12 @@ fn merge_switch(
     typed: Flag,
 ) -> Result<Flag, ApiError>
 {
+    let nested = nullable_boolean(kwargs, key)?;
     let Key(key) = key;
-    let nested = kwargs.shift_remove(key);
-    let nested = match nested {
-        | None | Some(Value::Null) => return Ok(typed),
-        | Some(Value::Bool(true)) => Flag::True,
-        | Some(Value::Bool(false)) => Flag::False,
-        | Some(_) => {
-            return Err(ApiError::invalid(
-                format!("{key} must be a boolean"),
-                Param(key),
-                Code("invalid_template_option"),
-            ));
-        },
-    };
+    let _merged = kwargs.shift_remove(key);
+    if nested == Flag::Unset {
+        return Ok(typed);
+    }
     if typed != Flag::Unset && typed != nested {
         return Err(ApiError::invalid(
             format!("conflicting {key} values"),
@@ -1735,13 +1753,20 @@ fn template_choices(body: &Object) -> Result<(Switch, Switch, Effort, String), A
             ));
         },
     };
-    let typed_thinking = boolean(body, Key("enable_thinking"))?;
+    let typed_thinking = nullable_boolean(body, Key("enable_thinking"))?;
     let thinking = merge_switch(&mut kwargs, Key("enable_thinking"), typed_thinking)?;
-    let typed_preserve = boolean(body, Key("preserve_thinking"))?;
+    let typed_preserve = nullable_boolean(body, Key("preserve_thinking"))?;
     let preserve = merge_switch(&mut kwargs, Key("preserve_thinking"), typed_preserve)?;
     let mut effort = match field(body, Key("reasoning_effort")) {
         | Maybe::Absent(_) => Effort::Unrequested,
         | Maybe::Present(value) => {
+            if !value.is_string() {
+                return Err(ApiError::invalid(
+                    String::from("reasoning_effort must be a string or null"),
+                    Param("reasoning_effort"),
+                    Code::NONE,
+                ));
+            }
             let Maybe::Present(effort) = effort_named(value)
             else {
                 return Err(ApiError::invalid(
@@ -2172,6 +2197,21 @@ mod tests
             template_choices(none.as_object().unwrap()).unwrap().3,
             "{}",
             "no arguments serialize as an empty object"
+        );
+        let mistyped = json!({"chat_template_kwargs": {"enable_thinking": "yes"}});
+        let refused = template_choices(mistyped.as_object().unwrap()).unwrap_err();
+        assert_eq!(
+            (refused.message.as_str(), refused.code.as_str()),
+            ("enable_thinking must be a boolean or null", ""),
+            "a mistyped nested switch fails as ninfer's parser fails it"
+        );
+        let unnamed = json!({"reasoning_effort": 3_i32});
+        assert_eq!(
+            template_choices(unnamed.as_object().unwrap())
+                .unwrap_err()
+                .message,
+            "reasoning_effort must be a string or null",
+            "an effort that is not a string"
         );
     }
 
