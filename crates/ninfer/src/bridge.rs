@@ -153,6 +153,10 @@ pub mod ffi
         host_state_slots: u32,
         /// Host KV capacity in bytes.
         host_kv_bytes: usize,
+        /// The `RoPE` scaling factor; one leaves positions unscaled.
+        rope_scaling_factor: f32,
+        /// The native position threshold past which `RoPE` positions scale.
+        rope_scaling_original_context: u32,
         /// How long a request may wait for admission, in milliseconds.
         pending_timeout_ms: u32,
         /// DFlash2's draft width `K`.
