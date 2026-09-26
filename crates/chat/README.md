@@ -10,4 +10,5 @@ The chat request and its outcome as [infinitum](https://github.com/silvanshade-o
 | Streaming | `ChatEvents`, `Channel`, `CancelToken` | The submission, the admission record and each published text delta, in order, and the consumer's cancellation. |
 | Outcome | `ChatOutcome`, `Finish`, `GeneratedToolCall`, `Telemetry` | Content, reasoning, parsed tool calls, the finish reason, token accounting, phase times and speculative tallies, and the request's timing, reuse path and thinking spend. |
 | Runtime | `Capacity`, `RuntimeCounters` | The capacities a backend resolved at startup, and snapshots of its cumulative token and round totals and request gauges. |
+| Startup | `StartupEvent`, `StartupObserver`, `Unobserved` | Each startup phase's beginning, byte progress, completion or failure, reported while a backend opens, and the observer that takes them. |
 | Contract | `ChatBackend`, `ChatFailure` | A backend runs one request to its outcome, publishing to the events as it goes, or fails with a classified reason. |

@@ -27,6 +27,7 @@ struct GenerationRecord;
 struct LoadRecord;
 struct Outcome;
 struct ReviewSink;
+struct StartupSink;
 
 /// One open ninfer Engine, owned by the Rust side through the `UniquePtr` `open_session` returns.
 class Session {
@@ -53,17 +54,20 @@ public:
 };
 
 /// Open an Engine for `config`: DFlash2 at `config.draft_width`, the optimized proposal head, an
-/// explicit KV capacity equal to `config.max_context`, and `config.chat_template` when non-empty.
+/// explicit KV capacity equal to `config.max_context`, and `config.chat_template` when non-empty,
+/// reporting each startup phase to `sink`.
 ///
 /// # Specification
 /// - requires: nothing.
 /// - ensures: on success a non-null session and `outcome.status` `Completed`; on failure a null
-///   pointer and `outcome` holding the exception's class and message.
+///   pointer and `outcome` holding the exception's class and message; either way `sink` received
+///   the Engine's startup reports in order, and no report reaches it after this returns.
 /// - provides: the only way to create a `Session`.
 /// - fails: when ninfer throws while opening (a missing or invalid artifact, an unsupported
 ///   option, device or allocation failure); reported through `outcome`, never thrown.
 /// - panics: none; every exception from ninfer is caught at its call site.
-std::unique_ptr<Session> open_session(const EngineConfig& config, Outcome& outcome) noexcept;
+std::unique_ptr<Session> open_session(const EngineConfig& config, StartupSink& sink,
+                                      Outcome& outcome) noexcept;
 
 /// Encode `text` with the artifact's tokenizer, adding no template or special token.
 ///

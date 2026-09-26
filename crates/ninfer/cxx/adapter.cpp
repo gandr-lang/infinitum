@@ -189,6 +189,155 @@ private:
     Controller& controller_;
 };
 
+/// ninfer's startup phase as the bridge names it.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: every phase ninfer names maps to the bridge's phase of the same name, and `true` is
+///   returned; a value outside ninfer's enumeration returns `false` and leaves `phase` unchanged.
+/// - provides: the phase translation for the startup relay.
+/// - fails: never.
+/// - panics: none.
+bool to_startup_phase(::ninfer::StartupPhase from, StartupPhase& phase) noexcept {
+    switch (from) {
+    case ::ninfer::StartupPhase::EngineStartup: phase = StartupPhase::EngineStartup; return true;
+    case ::ninfer::StartupPhase::CudaInitialize: phase = StartupPhase::CudaInitialize; return true;
+    case ::ninfer::StartupPhase::ArtifactInspect: phase = StartupPhase::ArtifactInspect; return true;
+    case ::ninfer::StartupPhase::TargetPlan: phase = StartupPhase::TargetPlan; return true;
+    case ::ninfer::StartupPhase::WeightsMaterialize:
+        phase = StartupPhase::WeightsMaterialize;
+        return true;
+    case ::ninfer::StartupPhase::WeightsStagingPin:
+        phase = StartupPhase::WeightsStagingPin;
+        return true;
+    case ::ninfer::StartupPhase::TargetFinalize: phase = StartupPhase::TargetFinalize; return true;
+    case ::ninfer::StartupPhase::FrontendInitialize:
+        phase = StartupPhase::FrontendInitialize;
+        return true;
+    case ::ninfer::StartupPhase::ProgramInitialize:
+        phase = StartupPhase::ProgramInitialize;
+        return true;
+    case ::ninfer::StartupPhase::HostStatePin: phase = StartupPhase::HostStatePin; return true;
+    case ::ninfer::StartupPhase::HostKvPin: phase = StartupPhase::HostKvPin; return true;
+    case ::ninfer::StartupPhase::CudaGraphPrepare: phase = StartupPhase::CudaGraphPrepare; return true;
+    case ::ninfer::StartupPhase::EngineFinalize: phase = StartupPhase::EngineFinalize; return true;
+    }
+    return false;
+}
+
+/// ninfer's startup status as the bridge names it.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: as `to_startup_phase`, for the status.
+/// - provides: the status translation for the startup relay.
+/// - fails: never.
+/// - panics: none.
+bool to_startup_status(::ninfer::StartupStatus from, StartupStatus& status) noexcept {
+    switch (from) {
+    case ::ninfer::StartupStatus::Begin: status = StartupStatus::Begin; return true;
+    case ::ninfer::StartupStatus::Progress: status = StartupStatus::Progress; return true;
+    case ::ninfer::StartupStatus::Complete: status = StartupStatus::Complete; return true;
+    case ::ninfer::StartupStatus::Failed: status = StartupStatus::Failed; return true;
+    }
+    return false;
+}
+
+/// Forwards the Engine's startup reports to the Rust sink until detached. The Engine keeps its
+/// options, the observer among them, after it opens, so the sink is reached only through a
+/// pointer `open_session` clears before it returns.
+class StartupRelay {
+public:
+    /// Attach to `sink`.
+    ///
+    /// # Specification
+    /// - requires: `sink` outlives every `forward` before `detach`.
+    /// - ensures: the relay is attached to `sink`.
+    /// - provides: the relay `open_session` hands to the Engine's options.
+    /// - fails: never.
+    /// - panics: none.
+    explicit StartupRelay(StartupSink& sink) noexcept : sink_(&sink) {}
+
+    /// Forward one report.
+    ///
+    /// # Specification
+    /// - requires: called on the thread running `open_session`. ninfer publishes each startup
+    ///   report synchronously, on the thread constructing the Engine (`StartupPhaseScope` in
+    ///   `core/startup.h`; no worker thread reports), and `open_session` constructs it inline.
+    /// - ensures: while attached, a report whose phase and status the bridge names reached the
+    ///   sink, its counts marked as bytes when ninfer counts bytes; once detached, nothing is
+    ///   forwarded.
+    /// - provides: the Engine's `StartupObserver` callback.
+    /// - fails: never.
+    /// - panics: none.
+    void forward(const ::ninfer::StartupEvent& event) noexcept {
+        StartupPhase phase{};
+        StartupStatus status{};
+        if (!to_startup_phase(event.phase, phase) || !to_startup_status(event.status, status)) {
+            return;
+        }
+        const StartupRecord record{
+            .phase      = phase,
+            .status     = status,
+            .bytes      = event.progress_unit == ::ninfer::StartupProgressUnit::Bytes,
+            .current    = event.current,
+            .total      = event.total,
+            .elapsed_ns = event.elapsed_ns,
+        };
+        const std::lock_guard lock(mutex_);
+        if (sink_ == nullptr) { return; }
+        startup_event(*sink_, record);
+    }
+
+    /// Stop reaching the sink.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: every later `forward` returns without touching the sink, and a `forward` in
+    ///   progress finishes before this returns.
+    /// - provides: the lifetime cut `open_session` relies on.
+    /// - fails: never.
+    /// - panics: none.
+    void detach() noexcept {
+        const std::lock_guard lock(mutex_);
+        sink_ = nullptr;
+    }
+
+private:
+    std::mutex mutex_;
+    StartupSink* sink_;
+};
+
+/// Detaches the startup relay on every exit from `open_session`.
+class DetachRelay {
+public:
+    /// Guard `relay` until the end of the enclosing scope.
+    ///
+    /// # Specification
+    /// - requires: `relay` outlives the guard.
+    /// - ensures: the guard refers to `relay`.
+    /// - provides: the scope `open_session` detaches on leaving.
+    /// - fails: never.
+    /// - panics: none.
+    explicit DetachRelay(StartupRelay& relay) noexcept : relay_(relay) {}
+    DetachRelay(const DetachRelay&)            = delete;
+    DetachRelay& operator=(const DetachRelay&) = delete;
+    DetachRelay(DetachRelay&&)                 = delete;
+    DetachRelay& operator=(DetachRelay&&)      = delete;
+    /// Detach the relay, on every exit from the guard's scope, exceptional ones included.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: `relay.detach()` has returned, so no later report reaches the sink.
+    /// - provides: the lifetime cut the bridge's `# Safety` section relies on.
+    /// - fails: never.
+    /// - panics: none.
+    ~DetachRelay() noexcept { relay_.detach(); }
+
+private:
+    StartupRelay& relay_;
+};
+
 /// The greedy request of ninfer's own C facade: argmax, no penalties, the model's stop tokens.
 ///
 /// # Specification
@@ -587,9 +736,15 @@ std::uint64_t activity_digest(const ::ninfer::RuntimeStats& stats) noexcept {
 
 Session::Session(::ninfer::Engine engine_) noexcept : engine(std::move(engine_)) {}
 
-std::unique_ptr<Session> open_session(const EngineConfig& config, Outcome& outcome) noexcept {
+std::unique_ptr<Session> open_session(const EngineConfig& config, StartupSink& sink,
+                                      Outcome& outcome) noexcept {
     try {
+        const auto relay = std::make_shared<StartupRelay>(sink);
+        const DetachRelay detach(*relay);
         ::ninfer::EngineOptions options;
+        options.startup_observer.callback = [relay](const ::ninfer::StartupEvent& event) {
+            relay->forward(event);
+        };
         options.artifact_path = std::string(config.artifact);
         if (!config.chat_template.empty()) {
             options.chat_template_path = std::string(config.chat_template);

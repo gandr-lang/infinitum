@@ -312,7 +312,8 @@ where
         request.max_context,
         request.cuda_graph,
     );
-    let mut session = infinitum_ninfer::Session::open(&options, plan)?;
+    let mut session =
+        infinitum_ninfer::Session::open(&options, plan, &mut infinitum_chat::Unobserved)?;
     let prompt = session.tokenize(infinitum_ninfer::RawText::from(request.prompt.0.as_str()))?;
     let generation = session.generate(&prompt, request.max_new_tokens.0)?;
     let text = session.detokenize(generation.generated())?;

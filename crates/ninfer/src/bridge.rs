@@ -29,9 +29,14 @@
 ///   thread that called it, through an output sink that lives on its stack and
 ///   is gone when it returns, and reaches the `CancelFlag`, an atomic flag
 ///   readable from any thread, only through cancellation views that end with
-///   the calls they are passed to; `Session` is used only through the
-///   `UniquePtr` `open_session` returns, and only when that pointer is
-///   non-null.
+///   the calls they are passed to; `open_session` reaches the `StartupSink`
+///   only from the thread that called it, because ninfer publishes each startup
+///   report synchronously from the Engine's constructor, which `open_session`
+///   runs inline, and only through a relay whose pointer to it is cleared under
+///   a mutex before it returns, so the observer the Engine keeps in its options
+///   never reaches the sink after its borrow ends; `Session` is used only
+///   through the `UniquePtr` `open_session` returns, and only when that pointer
+///   is non-null.
 #[cxx::bridge(namespace = "infinitum::ninfer")]
 pub mod ffi
 {
@@ -608,6 +613,71 @@ pub mod ffi
         Reasoning,
     }
 
+    /// A startup phase, as the adapter maps ninfer's.
+    #[derive(Debug)]
+    enum StartupPhase
+    {
+        /// The whole of opening.
+        EngineStartup,
+        /// CUDA context bring-up.
+        CudaInitialize,
+        /// Artifact inspection.
+        ArtifactInspect,
+        /// Target runtime planning.
+        TargetPlan,
+        /// Weight upload.
+        WeightsMaterialize,
+        /// Staging buffer pinning.
+        WeightsStagingPin,
+        /// Target finalization.
+        TargetFinalize,
+        /// Frontend initialization.
+        FrontendInitialize,
+        /// Runtime program initialization.
+        ProgramInitialize,
+        /// Host state pinning.
+        HostStatePin,
+        /// Host KV pinning.
+        HostKvPin,
+        /// CUDA graph capture.
+        CudaGraphPrepare,
+        /// Engine finalization.
+        EngineFinalize,
+    }
+
+    /// Where a startup phase is.
+    #[derive(Debug)]
+    enum StartupStatus
+    {
+        /// It began.
+        Begin,
+        /// It advanced.
+        Progress,
+        /// It finished.
+        Complete,
+        /// It failed.
+        Failed,
+    }
+
+    /// One startup report, as ninfer's `StartupEvent`.
+    #[derive(Debug)]
+    struct StartupRecord
+    {
+        /// The phase.
+        phase: StartupPhase,
+        /// Where it is.
+        status: StartupStatus,
+        /// Whether `current` and `total` count bytes; otherwise they are
+        /// unused.
+        bytes: bool,
+        /// Bytes done.
+        current: u64,
+        /// Bytes in all, zero when unknown.
+        total: u64,
+        /// The phase's nanoseconds, when it completes or fails.
+        elapsed_ns: u64,
+    }
+
     extern "Rust" {
         /// The Rust side of a round review.
         type ReviewSink;
@@ -617,6 +687,9 @@ pub mod ffi
 
         /// A chat request's cancellation flag.
         type CancelFlag;
+
+        /// The Rust side of an Engine's startup reports.
+        type StartupSink<'observer>;
 
         /// Review one round before its commit.
         fn review_round(
@@ -670,6 +743,12 @@ pub mod ffi
 
         /// Whether the consumer asked to stop.
         fn chat_cancelled(flag: &CancelFlag) -> bool;
+
+        /// One startup report.
+        fn startup_event(
+            sink: &mut StartupSink<'_>,
+            record: &StartupRecord,
+        );
     }
 
     // SAFETY: the declarations below are sound to call from safe Rust under
@@ -680,9 +759,11 @@ pub mod ffi
         /// One open Engine.
         type Session;
 
-        /// Open an Engine; null with a failed outcome on failure.
+        /// Open an Engine, reporting its startup to `sink`; null with a
+        /// failed outcome on failure.
         fn open_session(
             config: &EngineConfig,
+            sink: &mut StartupSink<'_>,
             outcome: &mut Outcome,
         ) -> UniquePtr<Session>;
 
@@ -777,4 +858,6 @@ pub use crate::chat::chat_publish;
 pub use crate::chat::chat_submitted;
 pub use crate::chat::chat_timing;
 pub use crate::session::ReviewSink;
+pub use crate::session::StartupSink;
 pub use crate::session::review_round;
+pub use crate::session::startup_event;

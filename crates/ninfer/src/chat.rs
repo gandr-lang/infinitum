@@ -45,6 +45,10 @@ use infinitum_chat::Sampling;
 use infinitum_chat::Seed;
 use infinitum_chat::Setting;
 use infinitum_chat::SpecialTokens;
+use infinitum_chat::StartupEvent;
+use infinitum_chat::StartupObserver;
+use infinitum_chat::StartupPhase;
+use infinitum_chat::StartupStatus;
 use infinitum_chat::StopScope;
 use infinitum_chat::StructuralPrefixes;
 use infinitum_chat::Submission;
@@ -554,16 +558,55 @@ pub struct ChatEngine
     load: LoadReport,
 }
 
+/// Why the Engine phase's duration is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unfinished
+{
+    /// The phase has not reported its completion.
+    NotReported,
+}
+
+/// An observer that notes the Engine phase's duration and forwards every
+/// report.
+struct EngineTimed<'observer>
+{
+    /// The caller's observer.
+    inner: &'observer mut dyn StartupObserver,
+    /// The Engine phase's duration, once it completed.
+    engine: Maybe<core::time::Duration, Unfinished>,
+}
+
+impl StartupObserver for EngineTimed<'_>
+{
+    /// Note the Engine phase's completion, then forward.
+    ///
+    /// # Specification
+    /// trivial.
+    fn observe(
+        &mut self,
+        event: StartupEvent,
+    )
+    {
+        if event.phase == StartupPhase::EngineStartup && event.status == StartupStatus::Complete {
+            self.engine = Maybe::Present(event.elapsed);
+        }
+        self.inner.observe(event);
+    }
+}
+
 impl ChatEngine
 {
-    /// Open an Engine for `options` running `plan`, and read its load
-    /// summary.
+    /// Open an Engine for `options` running `plan`, reporting its startup
+    /// phases to `observer`, and read its load summary.
     ///
     /// # Specification
     /// - requires: nothing.
     /// - ensures: on success the Engine is open as [`Session::open`] opens it,
-    ///   the model name is the artifact's, and the load report carries the wall
-    ///   time of opening and the Engine's weight bytes and CUDA sync mode.
+    ///   `observer` received its startup reports, the model name is the
+    ///   artifact's, and the load report carries the Engine phase's duration
+    ///   (the wall time of opening when that phase reported none), as ninfer's
+    ///   `engine ready` line takes it, and the Engine's weight bytes and CUDA
+    ///   sync mode.
     /// - provides: the chat backend over ninfer.
     /// - fails: as [`Session::open`] fails, or when reading the summary throws.
     /// - panics: none.
@@ -578,11 +621,19 @@ impl ChatEngine
     pub fn open(
         options: &EngineOptions,
         plan: DFlash2Plan,
+        observer: &mut dyn StartupObserver,
     ) -> Result<Self, EngineFailure>
     {
         let started = std::time::Instant::now();
-        let session = Session::open(options, plan)?;
-        let total = started.elapsed();
+        let mut timed = EngineTimed {
+            inner: observer,
+            engine: Maybe::Absent(Unfinished::NotReported),
+        };
+        let session = Session::open(options, plan, &mut timed)?;
+        let total = match timed.engine {
+            | Maybe::Present(elapsed) => elapsed,
+            | Maybe::Absent(Unfinished::NotReported) => started.elapsed(),
+        };
         let mut record = ffi::LoadRecord {
             model_name: String::new(),
             cuda_sync: String::new(),
