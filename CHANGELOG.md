@@ -10,6 +10,7 @@ All notable changes to infinitum are documented here.
 - _(engine)_ Run DFlash2 as an infinitum-owned round on ninfer (#4)
 - _(engine)_ Serve OpenAI chat completions on ninfer (#9)
 - _(engine)_ Configure serve's output, admission and body limits (#10)
+- _(engine)_ Size and store serve's KV cache (#11)
 
 ### Unreleased Bug Fixes
 
