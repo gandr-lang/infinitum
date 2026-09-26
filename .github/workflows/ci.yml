@@ -50,12 +50,11 @@ env:
   # hook tooling, act, commitlint) that no job invokes; the CI image
   # asserts this list against its own at build time.
   MISE_DISABLE_TOOLS: "cargo:silvanshade/aifix,cargo:tirith,github:colbymchenry/codegraph,github:max-sixty/worktrunk,github:nektos/act,github:j178/prek,npm:@commitlint/cli,weave-mcp"
-  # The switch for the Linux container image: the published image's pin-file
-  # hash, empty by default. While empty, the Rust jobs below resolve to no
-  # container and the setup-rust steps stay the toolchain source, the fallback
-  # while the image is unproven. The repository variable flips it to the
-  # image's tag once the first image build is green, with no workflow edit;
-  # act accepts the same variable.
+  # The Linux image switch is a repo-wide pin-file tag. Empty selects the
+  # bare-runner bootstrap. On main it remains the last landed tag until the
+  # matching image is published and the landing switches the variable. A PR
+  # or merge-group instead reads its own pin-file tag, so a candidate image can
+  # be proven without changing the image main and other PRs use.
   INFINITUM_CI_IMAGE: ${{ vars.INFINITUM_CI_IMAGE }}
 
 jobs:
@@ -188,16 +187,26 @@ jobs:
           jq -rRs '"rust=" + (split("\u0000") | any(length > 0 and ((endswith(".md") or startswith("docs/") or startswith("LICENSE") or . == ".gitignore") | not)) | tostring)'
           >> "$GITHUB_OUTPUT"
 
-  # container cannot read env directly; needs carries the workflow switch.
+  # container cannot read env directly; needs carries the workflow switch. A
+  # candidate PR or queue entry resolves its pin-file tag from its checkout,
+  # while main uses the last landed tag until the repository variable moves.
   ci-image-ref:
     name: resolve the CI image reference
     runs-on: *linux
     outputs:
       ref: ${{ steps.resolve.outputs.ref }}
     steps:
+      - *git-checkout
+      - id: pin_tag
+        name: compute candidate image tag
+        if: ${{ github.event_name != 'push' && env.INFINITUM_CI_IMAGE != '' }}
+        shell: bash
+        run: cat mise.toml mise.lock rust-toolchain.toml | sha256sum | sed 's/ .*//; s/^/tag=/' >> "$GITHUB_OUTPUT"
       - id: resolve
         name: resolve the image reference
-        run: echo "ref=${INFINITUM_CI_IMAGE:+ghcr.io/silvanshade-org/infinitum-ci:${INFINITUM_CI_IMAGE}}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE_TAG: ${{ steps.pin_tag.outputs.tag || env.INFINITUM_CI_IMAGE }}
+        run: echo "ref=${IMAGE_TAG:+ghcr.io/silvanshade-org/infinitum-ci:${IMAGE_TAG}}" >> "$GITHUB_OUTPUT"
 
   # `push` is in the condition, not just `merge_group`, because the push-to-main
   # run is the cache warmer: caches are readable only from the current branch,
