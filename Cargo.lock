@@ -228,6 +228,16 @@ name = "infinitum-round"
 version = "0.0.0"
 
 [[package]]
+name = "infinitum-tenstorrent"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "cxx",
+ "cxx-build",
+ "infinitum-round",
+]
+
+[[package]]
 name = "link-cplusplus"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

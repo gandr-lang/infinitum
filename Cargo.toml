@@ -26,6 +26,7 @@ license = "Apache-2.0 WITH LLVM-exception"
 # match against until the driver grows subcommands.
 # consumers:
 # - infinitum
+# - infinitum-tenstorrent (feature `device`)
 [workspace.dependencies.clap]
 version = "4.6.6"
 default-features = false
@@ -38,6 +39,7 @@ features = ["derive", "error-context", "help", "std", "usage"]
 # build script, not by the `c++*` features.
 # consumers:
 # - infinitum-ninfer (feature `engine`)
+# - infinitum-tenstorrent (feature `device`)
 [workspace.dependencies.cxx]
 version = "1.0.202"
 default-features = false
@@ -48,6 +50,7 @@ features = ["std"]
 # feature is needed; `parallel` only speeds a many-file build.
 # consumers:
 # - infinitum-ninfer (feature `engine`)
+# - infinitum-tenstorrent (feature `device`)
 [workspace.dependencies.cxx-build]
 version = "1.0.202"
 default-features = false
@@ -62,6 +65,7 @@ path = "crates/ninfer"
 # consumers:
 # - infinitum
 # - infinitum-ninfer
+# - infinitum-tenstorrent
 [workspace.dependencies.infinitum-round]
 path = "crates/round"
 

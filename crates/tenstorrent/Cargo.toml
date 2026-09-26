@@ -1,0 +1,40 @@
+# infinitum's Tenstorrent backend: the planner that maps a round graph onto
+# fragment-by-fragment lowerings through tt-mlir, the host reference the
+# device answers are compared with, and, behind `device`, the `cxx` bridge to
+# the C++ host that builds, lowers, and runs the Accept fragment. Without
+# `device` nothing links tt-mlir, so the planner and the reference build and
+# test on every host.
+[package]
+name = "infinitum-tenstorrent"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "The Tenstorrent backend of the infinitum engine"
+readme = "README.md"
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "accept-differential"
+path = "src/bin/accept_differential.rs"
+required-features = ["device"]
+
+[dependencies]
+clap = { workspace = true, optional = true }
+cxx = { workspace = true, optional = true }
+infinitum-round.workspace = true
+
+[build-dependencies]
+cxx-build = { workspace = true, optional = true }
+
+[features]
+# Build the bridge, link tt-mlir's compiler and runtime libraries, and build
+# the differential harness. The build reads `INFINITUM_TTMLIR_SOURCE` (a
+# tt-mlir checkout), `INFINITUM_TTMLIR_BUILD` (its build directory), and
+# `INFINITUM_TTMLIR_TOOLCHAIN` (the LLVM/MLIR installation it was built
+# against); see `README.md`.
+device = ["dep:clap", "dep:cxx", "dep:cxx-build"]
+
+[lints]
+workspace = true
