@@ -688,13 +688,11 @@ impl<'events> Logged<'events>
         };
     }
 
-    /// Log the request's end: its done line on success, else its failure
-    /// line in the phase it reached.
+    /// Log the request's end, as [`closing`] renders it.
     ///
     /// # Specification
     /// - requires: the request ran through these events.
-    /// - ensures: [`done`]'s line after `Ok`; [`failed`]'s line for the phase
-    ///   reached, before or after submission, after `Err`.
+    /// - ensures: [`closing`]'s line for the phase reached is written.
     /// - provides: every request's end record.
     /// - fails: never.
     /// - panics: none.
@@ -704,11 +702,45 @@ impl<'events> Logged<'events>
         result: Result<&ChatOutcome, &ApiError>,
     )
     {
-        match result {
-            | Ok(outcome) => emit(&done(&self.shape, outcome)),
-            | Err(error) => emit(&failed(&self.shape, self.phase, error)),
-        }
+        emit(&closing(&self.shape, self.phase, result));
     }
+}
+
+/// The line that ends a request.
+///
+/// # Specification
+/// - requires: `phase` is the phase the request reached.
+/// - ensures: [`done`]'s line after `Ok`, except that a streamed request
+///   cancelled by its client's disconnect takes [`failed`]'s client-disconnect
+///   line after submission, as ninfer's streaming transport logs it, while an
+///   aggregate one stays done; [`failed`]'s line for `phase` after `Err`.
+/// - provides: [`Logged::end`]'s record.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 on a finished, a streamed-cancelled, an aggregate-cancelled
+///   and a refused request.
+/// - witness: `tests::requests_close_as_ninfer_logs_them`
+fn closing(
+    shape: &RequestShape,
+    phase: Phase,
+    result: Result<&ChatOutcome, &ApiError>,
+) -> Record
+{
+    return match result {
+        | Ok(outcome)
+            if outcome.finish == Finish::Cancelled && shape.delivery == Delivery::Streaming =>
+        {
+            let disconnected = ApiError::from_failure(infinitum_chat::ChatFailure {
+                kind: infinitum_chat::FailureKind::Cancelled,
+                message: String::from("client disconnected"),
+            });
+            failed(shape, Phase::Generation, &disconnected)
+        },
+        | Ok(outcome) => done(shape, outcome),
+        | Err(error) => failed(shape, phase, error),
+    };
 }
 
 impl ChatEvents for Logged<'_>
@@ -1358,6 +1390,80 @@ mod tests
                 ),
             }),
             "a busy interval"
+        );
+    }
+
+    #[test]
+    fn requests_close_as_ninfer_logs_them()
+    {
+        let finished = ChatOutcome {
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            finish: Finish::Cancelled,
+            admission: Admission {
+                prompt_tokens: TokenCount::from(4_u32),
+                reused_tokens: TokenCount::ZERO,
+            },
+            generated: vec![TokenId::from(0_i32); 2],
+            reasoning_tokens: TokenCount::ZERO,
+            prompt_wall: core::time::Duration::ZERO,
+            generation_wall: core::time::Duration::ZERO,
+            drafted: Tally(0),
+            accepted: Tally(0),
+            telemetry: Telemetry {
+                first_token: core::time::Duration::from_millis(5),
+                total: core::time::Duration::from_millis(9),
+                prefill: core::time::Duration::ZERO,
+                decode: core::time::Duration::ZERO,
+                queue_wait: core::time::Duration::ZERO,
+                reuse: ReusePath::Root,
+                thinking: ThinkingSpend {
+                    budget: ThinkingBudget::Unlimited,
+                    model_tokens: TokenCount::ZERO,
+                    injected_tokens: TokenCount::ZERO,
+                },
+                accepted_per_position: Vec::new(),
+            },
+        };
+        let streamed = super::closing(&SHAPE, Phase::Generation, Ok(&finished));
+        assert_eq!(
+            (streamed.severity, streamed.message.as_str()),
+            (
+                Severity::Info,
+                "req#7 cancelled during transport | openai-chat | HTTP 499 | client disconnected"
+            ),
+            "a streamed request its client abandoned"
+        );
+        let aggregate = RequestShape {
+            delivery: Delivery::Aggregate,
+            ..SHAPE
+        };
+        assert!(
+            super::closing(&aggregate, Phase::Generation, Ok(&finished))
+                .message
+                .starts_with("req#7 done | openai-chat | cancelled |"),
+            "an aggregate cancellation stays done"
+        );
+        let stopped = ChatOutcome {
+            finish: Finish::StopToken,
+            ..finished
+        };
+        assert!(
+            super::closing(&SHAPE, Phase::Generation, Ok(&stopped))
+                .message
+                .starts_with("req#7 done | openai-chat | stop token |"),
+            "a finished stream is done"
+        );
+        let refused = ApiError::from_failure(infinitum_chat::ChatFailure {
+            kind: infinitum_chat::FailureKind::ContextLength,
+            message: String::from("too long"),
+        });
+        assert!(
+            super::closing(&SHAPE, Phase::Prepare, Err(&refused))
+                .message
+                .starts_with("req#7 rejected during prepare |"),
+            "a refusal before submission"
         );
     }
 

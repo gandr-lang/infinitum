@@ -133,16 +133,17 @@ features = ["preserve_order", "std"]
 # The async runtime under `axum`, and the channels a blocking generation
 # streams through. `rt-multi-thread` runs the server, `net` binds the
 # listener, `sync` carries deltas and the stream's start to the response,
-# `time` paces the stream's keep-alive comments; signals and file I/O are
-# unused. The serve crate's tests add `macros` for `#[tokio::test]` and
-# `test-util` to pause the clock under the throughput reporter.
+# `time` paces the stream's keep-alive comments and the throughput reporter,
+# and `signal` stops the server on SIGINT and SIGTERM; file I/O is unused.
+# The serve crate's tests add `macros` for `#[tokio::test]` and `test-util`
+# to pause the clock under the throughput reporter.
 # consumers:
 # - infinitum (feature `ninfer`)
 # - infinitum-serve
 [workspace.dependencies.tokio]
 version = "1.53.1"
 default-features = false
-features = ["net", "rt-multi-thread", "sync", "time"]
+features = ["net", "rt-multi-thread", "signal", "sync", "time"]
 
 # The `Stream` trait a streamed response's body implements. No feature is
 # needed for the trait; the default `time` is unused.

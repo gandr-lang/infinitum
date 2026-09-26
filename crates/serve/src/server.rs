@@ -867,25 +867,33 @@ pub fn warm_up(
     return Ok(());
 }
 
-/// Serve the chat surface on `listener` until the listener fails.
+/// Serve the chat surface on `listener` until an interrupt or termination
+/// signal asks it to stop.
 ///
 /// # Specification
-/// - requires: called within a multi-threaded tokio runtime with timers.
+/// - requires: called within a multi-threaded tokio runtime with timers and
+///   signal handling.
 /// - ensures: the ready line is logged, then the four routes answer as their
 ///   handlers specify, behind the gate, with request bodies capped at the
-///   configured size, while throughput is logged at the configured interval.
+///   configured size, while throughput is logged at the configured interval; on
+///   SIGINT or SIGTERM (Ctrl-C off Unix) the server stops accepting, finishes
+///   its open connections, logs `server stopped` and returns, as ninfer's
+///   server stops on those signals.
 /// - provides: `infinitum serve`'s server.
-/// - fails: when the listener has no address or accepting fails.
+/// - fails: when the listener has no address, the signal handlers cannot be
+///   installed, or accepting fails.
 /// - panics: none.
 ///
 /// # Errors
-/// - [`std::io::Error`]: the server stopped.
+/// - [`std::io::Error`]: the server could not start or failed.
 ///
 /// # Adequacy
 /// - hypothesis: L2 — `tests::routes_answer_through_the_gate` drives the router
-///   with a scripted backend; the served comparison against `ninfer-serve`
+///   with a scripted backend and `tests::a_termination_signal_stops_the_server`
+///   stops a running server; the served comparison against `ninfer-serve`
 ///   checks the engine path end to end.
 /// - witness: `tests::routes_answer_through_the_gate`
+/// - witness: `tests::a_termination_signal_stops_the_server`
 #[inline]
 pub async fn serve(
     listener: tokio::net::TcpListener,
@@ -893,6 +901,7 @@ pub async fn serve(
     config: ServeConfig,
 ) -> Result<(), std::io::Error>
 {
+    let stop = stop_requested()?;
     crate::oplog::emit(&crate::oplog::listening(
         listener.local_addr()?,
         &config.model,
@@ -905,7 +914,78 @@ pub async fn serve(
             crate::oplog::emit,
         ));
     }
-    return axum::serve(listener, router(backend, config)).await;
+    axum::serve(listener, router(backend, config))
+        .with_graceful_shutdown(stop)
+        .await?;
+    crate::oplog::emit(&crate::oplog::Record {
+        severity: crate::oplog::Severity::Info,
+        message: String::from("server stopped"),
+    });
+    return Ok(());
+}
+
+/// A future that completes when SIGINT or SIGTERM arrives.
+///
+/// # Specification
+/// - requires: called within a tokio runtime with signal handling.
+/// - ensures: both handlers are installed before it returns, replacing an
+///   inherited ignore, and the future completes at the first of either signal.
+/// - provides: [`serve`]'s stop request.
+/// - fails: when a handler cannot be installed.
+/// - panics: none.
+///
+/// # Errors
+/// - [`std::io::Error`]: a handler could not be installed.
+///
+/// # Adequacy
+/// - hypothesis: L2 — the test sends the process SIGTERM once the server
+///   answers, and the server returns.
+/// - witness: `tests::a_termination_signal_stops_the_server`
+#[cfg(unix)]
+fn stop_requested() -> Result<impl Future<Output = ()>, std::io::Error>
+{
+    use tokio::signal::unix::SignalKind;
+    use tokio::signal::unix::signal;
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    return Ok(core::future::poll_fn(move |cx| {
+        if interrupt.poll_recv(cx).is_ready() || terminate.poll_recv(cx).is_ready() {
+            return core::task::Poll::Ready(());
+        }
+        return core::task::Poll::Pending;
+    }));
+}
+
+/// A future that completes on Ctrl-C.
+///
+/// # Specification
+/// - requires: called within a tokio runtime with signal handling.
+/// - ensures: completes at the first Ctrl-C; never, when Ctrl-C cannot be
+///   watched.
+/// - provides: [`serve`]'s stop request off Unix.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Errors
+/// - [`std::io::Error`]: never; the signature matches the Unix form.
+///
+/// # Adequacy
+/// - hypothesis: L1 — console events are process-wide; the Unix form carries
+///   the tested stop.
+/// - witness: `tests::a_termination_signal_stops_the_server`
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Unix form installs handlers that can fail"
+)]
+fn stop_requested() -> Result<impl Future<Output = ()>, std::io::Error>
+{
+    return Ok(async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            core::future::pending::<()>().await;
+        }
+    });
 }
 
 /// Write the backend's throughput every `period` through `write`, as
@@ -1514,5 +1594,57 @@ mod tests
             ],
             "one active line, then the warning"
         );
+    }
+
+    /// A running server stops and returns once the process receives SIGTERM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_termination_signal_stops_the_server()
+    {
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(super::serve(
+            listener,
+            Arc::new(Scripted(ModelName(String::from("m")))),
+            ServeConfig {
+                model: ModelId(String::from("m")),
+                access: Access::Open,
+                max_model_len: TokenCount::from(64_u32),
+                defaults: Defaults {
+                    output_tokens: TokenCount::from(16_u32),
+                    thinking_budget: infinitum_chat::ThinkingBudget::Unlimited,
+                },
+                max_request: RequestBytes(core::num::NonZeroUsize::new(1024).unwrap()),
+                stats: super::StatsInterval::Off,
+            },
+        ));
+        let answered = tokio::task::spawn_blocking(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            return response;
+        })
+        .await
+        .unwrap();
+        assert!(
+            answered.starts_with("HTTP/1.1 200"),
+            "the server answered: {answered}"
+        );
+        let sent = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill ran");
+        let stopped = tokio::time::timeout(core::time::Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stopped.is_ok(), "the server returned cleanly");
     }
 }
