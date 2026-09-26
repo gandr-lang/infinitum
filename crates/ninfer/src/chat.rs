@@ -9,35 +9,47 @@
 
 use infinitum_chat::Admission;
 use infinitum_chat::Automatic;
+use infinitum_chat::ByteSize;
 use infinitum_chat::CacheBoundary;
 use infinitum_chat::CacheMarker;
 use infinitum_chat::CancelToken;
 use infinitum_chat::Cancellation;
+use infinitum_chat::Capacity;
 use infinitum_chat::Channel;
 use infinitum_chat::ChatBackend;
 use infinitum_chat::ChatEvents;
 use infinitum_chat::ChatFailure;
 use infinitum_chat::ChatOutcome;
 use infinitum_chat::ChatRequest;
+use infinitum_chat::ContextCache;
+use infinitum_chat::CounterDigest;
 use infinitum_chat::Delivery;
 use infinitum_chat::DeltaText;
 use infinitum_chat::Effort;
 use infinitum_chat::FailureKind;
 use infinitum_chat::Finish;
 use infinitum_chat::GeneratedToolCall;
+use infinitum_chat::KvSizing;
 use infinitum_chat::Marked;
 use infinitum_chat::ModelName;
 use infinitum_chat::PrefixReuse;
+use infinitum_chat::RequestGauges;
+use infinitum_chat::ReusePath;
 use infinitum_chat::Role;
+use infinitum_chat::RuntimeCounters;
 use infinitum_chat::Sampling;
 use infinitum_chat::Seed;
 use infinitum_chat::Setting;
 use infinitum_chat::SpecialTokens;
 use infinitum_chat::StopScope;
 use infinitum_chat::StructuralPrefixes;
+use infinitum_chat::Submission;
 use infinitum_chat::Switch;
 use infinitum_chat::Tally;
+use infinitum_chat::Telemetry;
+use infinitum_chat::Thinking;
 use infinitum_chat::ThinkingBudget;
+use infinitum_chat::ThinkingSpend;
 use infinitum_round::Maybe;
 use infinitum_round::TokenCount;
 use infinitum_round::TokenId;
@@ -63,18 +75,36 @@ pub struct ChatSink<'events>
 #[repr(transparent)]
 pub struct CancelFlag(CancelToken);
 
-/// Tell the consumer the request was submitted.
+/// Tell the consumer the request was submitted, with what preparation
+/// decided.
 ///
 /// # Specification
-/// - requires: called once, after a streaming request's submission and before
+/// - requires: called once, after the request's submission and before
 ///   [`chat_admitted`].
-/// - ensures: the consumer was told.
-/// - provides: the bridge's entry for the point a streamed response begins.
+/// - ensures: the consumer was told whether the turn opens in thinking and
+///   under which budget, zero read as unlimited.
+/// - provides: the bridge's entry for the point a streamed response begins and
+///   the request's start record.
 /// - fails: never.
 /// - panics: none.
-pub fn chat_submitted(sink: &mut ChatSink<'_>)
+// The bridge fixes this signature; the flag and the count are wrapped on the
+// first line.
+pub fn chat_submitted(
+    sink: &mut ChatSink<'_>,
+    thinking_open: bool,
+    thinking_budget: u32,
+)
 {
-    sink.events.submitted();
+    sink.events.submitted(Submission {
+        thinking: if thinking_open {
+            Thinking::Open
+        }
+        else {
+            Thinking::Closed
+        },
+        thinking_budget: core::num::NonZeroU32::new(thinking_budget)
+            .map_or(ThinkingBudget::Unlimited, ThinkingBudget::Tokens),
+    });
 }
 
 /// Forward the admission record to the consumer.
@@ -405,6 +435,22 @@ const fn finish_of(finish: ffi::Finish) -> Finish
     };
 }
 
+/// Read the adapter's reuse source.
+///
+/// # Specification
+/// trivial.
+fn reuse_of(source: ffi::ReuseSource) -> ReusePath
+{
+    return match source {
+        | ffi::ReuseSource::PrivateEndpoint => ReusePath::PrivateEndpoint,
+        | ffi::ReuseSource::TurnClosure => ReusePath::TurnClosure,
+        | ffi::ReuseSource::ResponseReplay => ReusePath::ResponseReplay,
+        | ffi::ReuseSource::LongAnchor => ReusePath::LongAnchor,
+        | ffi::ReuseSource::SharedPrefix => ReusePath::SharedPrefix,
+        | _ => ReusePath::Root,
+    };
+}
+
 /// An empty record for the adapter to fill.
 ///
 /// # Specification
@@ -424,6 +470,16 @@ fn blank_record() -> ffi::ChatRecord
         generation_wall_ns: 0,
         drafted: 0,
         accepted: 0,
+        first_token_ns: 0,
+        total_ns: 0,
+        prefill_ns: 0,
+        decode_ns: 0,
+        queue_wait_ns: 0,
+        reuse: ffi::ReuseSource::Root,
+        thinking_budget: 0,
+        thinking_model_tokens: 0,
+        thinking_injected_tokens: 0,
+        accepted_per_position: Vec::new(),
     };
 }
 
@@ -471,6 +527,126 @@ impl ChatEngine
             model: ModelName(model),
         });
     }
+    /// The capacities the Engine resolved when it opened.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the Engine's KV capacity, storage by its option
+    ///   name, sizing, page groups, runtime reservation, free memory and
+    ///   effective context-cache capacities.
+    /// - provides: the startup capacity lines.
+    /// - fails: when ninfer throws.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`EngineFailure`]: reading the summary failed.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L1 — exercised on a GPU host by the `serve` acceptance
+    ///   run, whose capacity lines are compared with `ninfer-serve`'s.
+    #[inline]
+    pub fn capacity(&self) -> Result<Capacity, EngineFailure>
+    {
+        let mut record = ffi::CapacityRecord {
+            kv_tokens: 0,
+            kv_storage: ffi::KvStorage::BFloat16,
+            kv_sizing: ffi::KvSizing::Explicit,
+            pages: 0,
+            max_pages: 0,
+            runtime_bytes: 0,
+            free_bytes: 0,
+            cache_enabled: false,
+            lanes: 0,
+            device_states: 0,
+            host_states: 0,
+            host_kv_bytes: 0,
+            private_continuations: 0,
+            shared_prefixes: 0,
+            long_anchors: 0,
+        };
+        let mut outcome = pending();
+        ffi::capacity(self.session.engine(), &mut record, &mut outcome);
+        check(Operation::Capacity, outcome)?;
+        return Ok(capacity_of(&record));
+    }
+}
+
+/// The bridge's capacity record in the chat crate's terms.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: every count carried over; the storage named as its command-line
+///   option; the cache root-only when disabled.
+/// - provides: [`ChatEngine::capacity`]'s result.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 on both cache forms.
+/// - witness: `tests::capacity_records_translate`
+fn capacity_of(record: &ffi::CapacityRecord) -> Capacity
+{
+    let kv_storage = match record.kv_storage {
+        | ffi::KvStorage::Int8 => "int8",
+        | ffi::KvStorage::Fp8 => "fp8",
+        | ffi::KvStorage::Nvfp4 => "nvfp4",
+        | ffi::KvStorage::Fp8KeyNvfp4Value => "k8v4",
+        | _ => "bf16",
+    };
+    let cache = if record.cache_enabled {
+        ContextCache::Enabled {
+            lanes: Tally(u64::from(record.lanes)),
+            device_states: Tally(u64::from(record.device_states)),
+            host_states: Tally(u64::from(record.host_states)),
+            host_kv: ByteSize(record.host_kv_bytes),
+            private: Tally(u64::from(record.private_continuations)),
+            shared: Tally(u64::from(record.shared_prefixes)),
+            anchors: Tally(u64::from(record.long_anchors)),
+        }
+    }
+    else {
+        ContextCache::RootOnly
+    };
+    return Capacity {
+        kv_tokens: Tally(u64::from(record.kv_tokens)),
+        kv_storage: String::from(kv_storage),
+        kv_sizing: if record.kv_sizing == ffi::KvSizing::Automatic {
+            KvSizing::Automatic
+        }
+        else {
+            KvSizing::Explicit
+        },
+        pages: Tally(u64::from(record.pages)),
+        max_pages: Tally(u64::from(record.max_pages)),
+        runtime: ByteSize(record.runtime_bytes),
+        free: ByteSize(record.free_bytes),
+        cache,
+    };
+}
+
+/// The bridge's counter record in the chat crate's terms.
+///
+/// # Specification
+/// trivial.
+fn counters_of(record: &ffi::CounterRecord) -> RuntimeCounters
+{
+    return RuntimeCounters {
+        prefill_tokens: Tally(record.prefill_tokens),
+        decode_tokens: Tally(record.decode_tokens),
+        decode_rounds: Tally(record.decode_rounds),
+        decode_rows: Tally(record.decode_rows),
+        requests: RequestGauges {
+            running: Tally(u64::from(record.running)),
+            prefilling: Tally(u64::from(record.prefilling)),
+            decode_ready: Tally(u64::from(record.decode_ready)),
+            waiting: Tally(u64::from(record.waiting)),
+            materializing: Tally(u64::from(record.materializing)),
+            capture_pending: Tally(u64::from(record.capture_pending)),
+            terminal_pending: Tally(u64::from(record.terminal_pending)),
+        },
+        host_active: core::time::Duration::from_nanos(record.host_active_ns),
+        digest: CounterDigest(record.digest),
+    };
 }
 
 impl ChatBackend for ChatEngine
@@ -483,6 +659,46 @@ impl ChatBackend for ChatEngine
     fn model_name(&self) -> &ModelName
     {
         return &self.model;
+    }
+
+    /// The Engine's published runtime statistics.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: as [`ChatBackend::counters`] specifies; the totals, gauges,
+    ///   host-active time and digest are ninfer's.
+    /// - provides: the throughput report's samples on ninfer.
+    /// - fails: when ninfer throws, as [`FailureKind::Internal`].
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`ChatFailure`]: as stated.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L1 — exercised on a GPU host by the `serve` acceptance
+    ///   run, whose throughput lines are compared with `ninfer-serve`'s.
+    #[inline]
+    fn counters(&self) -> Result<RuntimeCounters, ChatFailure>
+    {
+        let mut record = ffi::CounterRecord {
+            prefill_tokens: 0,
+            decode_tokens: 0,
+            decode_rounds: 0,
+            decode_rows: 0,
+            running: 0,
+            prefilling: 0,
+            decode_ready: 0,
+            waiting: 0,
+            materializing: 0,
+            capture_pending: 0,
+            terminal_pending: 0,
+            host_active_ns: 0,
+            digest: 0,
+        };
+        let mut outcome = pending();
+        ffi::counters(self.session.engine(), &mut record, &mut outcome);
+        classify(outcome)?;
+        return Ok(counters_of(&record));
     }
 
     /// Run `request` on the Engine, with infinitum's preview reviewing each
@@ -560,6 +776,25 @@ impl ChatBackend for ChatEngine
             generation_wall: core::time::Duration::from_nanos(record.generation_wall_ns),
             drafted: Tally(record.drafted),
             accepted: Tally(record.accepted),
+            telemetry: Telemetry {
+                first_token: core::time::Duration::from_nanos(record.first_token_ns),
+                total: core::time::Duration::from_nanos(record.total_ns),
+                prefill: core::time::Duration::from_nanos(record.prefill_ns),
+                decode: core::time::Duration::from_nanos(record.decode_ns),
+                queue_wait: core::time::Duration::from_nanos(record.queue_wait_ns),
+                reuse: reuse_of(record.reuse),
+                thinking: ThinkingSpend {
+                    budget: core::num::NonZeroU32::new(record.thinking_budget)
+                        .map_or(ThinkingBudget::Unlimited, ThinkingBudget::Tokens),
+                    model_tokens: TokenCount::from(record.thinking_model_tokens),
+                    injected_tokens: TokenCount::from(record.thinking_injected_tokens),
+                },
+                accepted_per_position: record
+                    .accepted_per_position
+                    .into_iter()
+                    .map(Tally)
+                    .collect(),
+            },
         });
     }
 }
@@ -578,10 +813,87 @@ mod tests
     use infinitum_chat::Sampling;
     use infinitum_chat::Setting;
 
+    use super::capacity_of;
     use super::classify;
     use super::ffi;
     use super::lower_mark;
     use super::lower_sampling;
+
+    /// Each storage takes ninfer's log name, the sizing and counts carry
+    /// over, and a disabled cache is root-only whatever its counts read.
+    #[test]
+    fn capacity_records_translate()
+    {
+        let mut record = ffi::CapacityRecord {
+            kv_tokens: 539_520,
+            kv_storage: ffi::KvStorage::Fp8KeyNvfp4Value,
+            kv_sizing: ffi::KvSizing::Automatic,
+            pages: 2_107,
+            max_pages: 2_108,
+            runtime_bytes: 3,
+            free_bytes: 4,
+            cache_enabled: true,
+            lanes: 3,
+            device_states: 5,
+            host_states: 8,
+            host_kv_bytes: 9,
+            private_continuations: 6,
+            shared_prefixes: 4,
+            long_anchors: 2,
+        };
+        let capacity = capacity_of(&record);
+        assert_eq!(
+            (
+                capacity.kv_tokens,
+                capacity.kv_sizing,
+                capacity.pages,
+                capacity.max_pages
+            ),
+            (
+                infinitum_chat::Tally(539_520),
+                infinitum_chat::KvSizing::Automatic,
+                infinitum_chat::Tally(2_107),
+                infinitum_chat::Tally(2_108)
+            ),
+            "the KV counts and sizing"
+        );
+        assert_eq!(
+            capacity.cache,
+            infinitum_chat::ContextCache::Enabled {
+                lanes: infinitum_chat::Tally(3),
+                device_states: infinitum_chat::Tally(5),
+                host_states: infinitum_chat::Tally(8),
+                host_kv: infinitum_chat::ByteSize(9),
+                private: infinitum_chat::Tally(6),
+                shared: infinitum_chat::Tally(4),
+                anchors: infinitum_chat::Tally(2),
+            },
+            "an enabled cache's capacities"
+        );
+        for (storage, name) in [
+            (ffi::KvStorage::BFloat16, "bf16"),
+            (ffi::KvStorage::Int8, "int8"),
+            (ffi::KvStorage::Fp8, "fp8"),
+            (ffi::KvStorage::Nvfp4, "nvfp4"),
+            (ffi::KvStorage::Fp8KeyNvfp4Value, "k8v4"),
+        ] {
+            record.kv_storage = storage;
+            assert_eq!(capacity_of(&record).kv_storage, name, "{name}");
+        }
+        record.cache_enabled = false;
+        record.kv_sizing = ffi::KvSizing::Explicit;
+        let disabled = capacity_of(&record);
+        assert_eq!(
+            disabled.cache,
+            infinitum_chat::ContextCache::RootOnly,
+            "a disabled cache"
+        );
+        assert_eq!(
+            disabled.kv_sizing,
+            infinitum_chat::KvSizing::Explicit,
+            "explicit sizing"
+        );
+    }
 
     /// Each location carries its counts, and the evidence bits are ninfer's
     /// `SharedCandidateEvidence` values.

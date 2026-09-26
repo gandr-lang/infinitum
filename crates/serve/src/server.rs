@@ -29,12 +29,16 @@ use infinitum_chat::ChatEvents;
 use infinitum_chat::ChatRequest;
 use infinitum_chat::Delivery;
 use infinitum_chat::DeltaText;
+use infinitum_chat::Submission;
 use infinitum_round::TokenCount;
 use serde_json::json;
 
 use crate::error::ApiError;
 use crate::error::Code;
 use crate::error::Param;
+use crate::oplog::Logged;
+use crate::oplog::RequestId;
+use crate::oplog::RequestShape;
 use crate::parse::Defaults;
 use crate::parse::FreshSeed;
 use crate::parse::ParsedChat;
@@ -144,6 +148,18 @@ pub struct ServeConfig
     pub defaults: Defaults,
     /// The largest request body accepted.
     pub max_request: RequestBytes,
+    /// How often throughput is logged.
+    pub stats: StatsInterval,
+}
+
+/// How often the server logs throughput.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsInterval
+{
+    /// Never.
+    Off,
+    /// At this period, for intervals that saw activity.
+    Every(core::time::Duration),
 }
 
 /// What every handler shares.
@@ -153,6 +169,27 @@ struct Shared
     backend: Arc<dyn ChatBackend>,
     /// The configuration.
     config: ServeConfig,
+    /// The last request number the log used.
+    requests: core::sync::atomic::AtomicU64,
+}
+
+impl Shared
+{
+    /// Number the next request.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: a number one more than the last, from one.
+    /// - provides: the log's `req#` numbers.
+    /// - fails: never.
+    /// - panics: none.
+    fn next_request(&self) -> RequestId
+    {
+        let last = self
+            .requests
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return RequestId(last.saturating_add(1));
+    }
 }
 
 /// A JSON response.
@@ -394,7 +431,10 @@ impl ChatEvents for Aggregate
     /// # Specification
     /// trivial.
     #[inline]
-    fn submitted(&mut self)
+    fn submitted(
+        &mut self,
+        _submission: Submission,
+    )
     {
     }
 
@@ -474,7 +514,10 @@ impl ChatEvents for Streamed
     /// # Specification
     /// trivial.
     #[inline]
-    fn submitted(&mut self)
+    fn submitted(
+        &mut self,
+        _submission: Submission,
+    )
     {
         self.begin();
     }
@@ -573,7 +616,8 @@ impl tokio_stream::Stream for EventBody
 /// # Specification
 /// - requires: nothing.
 /// - ensures: 200 with the completion, or the failure's error response; if the
-///   handler is dropped first, the request is cancelled.
+///   handler is dropped first, the request is cancelled; the request's start
+///   and end are logged.
 /// - provides: non-streamed completions.
 /// - fails: never; failures are responses.
 /// - panics: none.
@@ -586,12 +630,20 @@ async fn aggregate(
     let cancel = CancelToken::new();
     let _guard = CancelOnDrop(cancel.clone());
     let backend = Arc::clone(&shared.backend);
-    let ran =
-        tokio::task::spawn_blocking(move || return backend.run(&request, &mut Aggregate, &cancel))
-            .await;
+    let shape = RequestShape::of(shared.next_request(), &request);
+    let ran = tokio::task::spawn_blocking(move || {
+        let mut aggregate = Aggregate;
+        let mut events = Logged::new(&mut aggregate, shape);
+        let ran = backend
+            .run(&request, &mut events, &cancel)
+            .map_err(ApiError::from_failure);
+        events.end(ran.as_ref());
+        return ran;
+    })
+    .await;
     return match ran {
         | Ok(Ok(outcome)) => json_response(StatusCode::OK, completion(&identity, &outcome)),
-        | Ok(Err(failure)) => error_response(&ApiError::from_failure(failure)),
+        | Ok(Err(error)) => error_response(&error),
         | Err(join) => error_response(&ApiError::internal(join.to_string())),
     };
 }
@@ -603,7 +655,7 @@ async fn aggregate(
 /// - ensures: a failure before submission is an error response; after it, a 200
 ///   event stream of the opening chunk, the deltas, and either the closing
 ///   chunks or an error event; dropping the handler or the body cancels the
-///   request.
+///   request; the request's start and end are logged.
 /// - provides: streamed completions.
 /// - fails: never; failures are responses or events.
 /// - panics: none.
@@ -620,16 +672,20 @@ async fn streamed(
     let backend = Arc::clone(&shared.backend);
     let request = parsed.request;
     let encoder = ChunkStream::new(identity, parsed.include_usage);
+    let shape = RequestShape::of(shared.next_request(), &request);
     let _running = tokio::task::spawn_blocking(move || {
         let mut sink = Streamed {
             encoder,
             body,
             begun: Begun::Pending(decision),
         };
-        let ran = backend.run(&request, &mut sink, &cancel);
+        let mut events = Logged::new(&mut sink, shape);
+        let ran = backend
+            .run(&request, &mut events, &cancel)
+            .map_err(ApiError::from_failure);
+        events.end(ran.as_ref());
         let terminal = match ran {
-            | Err(failure) => {
-                let error = ApiError::from_failure(failure);
+            | Err(error) => {
                 if let Begun::Pending(decision) =
                     core::mem::replace(&mut sink.begun, Begun::Streaming)
                 {
@@ -743,7 +799,8 @@ async fn chat(
 /// - ensures: on success the backend has generated up to four tokens for a
 ///   one-turn `hi` prompt, with model sampling defaults, the default thinking
 ///   budget `thinking_budget`, and the prefix cache neither read nor written,
-///   as ninfer's server warms up.
+///   as ninfer's server warms up; a warm-up of a quarter second or more logs
+///   `warmup complete | <duration>`, as ninfer's does at its info level.
 /// - provides: the start-up warm-up.
 /// - fails: when the request fails.
 /// - panics: none.
@@ -795,19 +852,30 @@ pub fn warm_up(
         },
         delivery: Delivery::Aggregate,
     };
-    return backend
-        .run(&request, &mut Aggregate, &CancelToken::new())
-        .map(|_outcome| {});
+    let started = std::time::Instant::now();
+    backend.run(&request, &mut Aggregate, &CancelToken::new())?;
+    let elapsed = started.elapsed();
+    if elapsed.as_secs_f64() >= 0.25_f64 {
+        crate::oplog::emit(&crate::oplog::Record {
+            severity: crate::oplog::Severity::Info,
+            message: format!(
+                "warmup complete | {}",
+                crate::pretty::Duration(elapsed.as_secs_f64())
+            ),
+        });
+    }
+    return Ok(());
 }
 
 /// Serve the chat surface on `listener` until the listener fails.
 ///
 /// # Specification
 /// - requires: called within a multi-threaded tokio runtime with timers.
-/// - ensures: the four routes answer as their handlers specify, behind the
-///   gate, with request bodies capped at the configured size.
+/// - ensures: the ready line is logged, then the four routes answer as their
+///   handlers specify, behind the gate, with request bodies capped at the
+///   configured size, while throughput is logged at the configured interval.
 /// - provides: `infinitum serve`'s server.
-/// - fails: when accepting fails.
+/// - fails: when the listener has no address or accepting fails.
 /// - panics: none.
 ///
 /// # Errors
@@ -825,7 +893,77 @@ pub async fn serve(
     config: ServeConfig,
 ) -> Result<(), std::io::Error>
 {
+    crate::oplog::emit(&crate::oplog::listening(
+        listener.local_addr()?,
+        &config.model,
+        &config.access,
+    ));
+    if let StatsInterval::Every(period) = config.stats {
+        tokio::spawn(report_throughput(
+            Arc::clone(&backend),
+            period,
+            crate::oplog::emit,
+        ));
+    }
     return axum::serve(listener, router(backend, config)).await;
+}
+
+/// Write the backend's throughput every `period` through `write`, as
+/// ninfer's stats reporter logs it.
+///
+/// # Specification
+/// - requires: called within a tokio runtime with timers.
+/// - ensures: each period, the counters are sampled and the
+///   [`crate::oplog::throughput`] line for the interval since the last sample
+///   is written when it saw activity; a late tick waits a full period from when
+///   it ran, as ninfer resets a missed deadline; a failed sample writes one
+///   warning and ends the reporter.
+/// - provides: the periodic throughput log.
+/// - fails: never; a failed sample ends the reporter, not the server.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 under a paused clock on a quiet interval, an active one and
+///   a failed sample.
+/// - witness: `tests::throughput_reports_active_intervals_until_a_sample_fails`
+async fn report_throughput<Write>(
+    backend: Arc<dyn ChatBackend>,
+    period: core::time::Duration,
+    mut write: Write,
+) where
+    Write: FnMut(&crate::oplog::Record),
+{
+    let stopped = |failure: &infinitum_chat::ChatFailure| {
+        return crate::oplog::Record {
+            severity: crate::oplog::Severity::Warning,
+            message: format!("throughput reporting stopped | {}", failure.message),
+        };
+    };
+    let mut previous = match backend.counters() {
+        | Ok(counters) => counters,
+        | Err(failure) => return write(&stopped(&failure)),
+    };
+    let mut previous_time = tokio::time::Instant::now();
+    let mut ticks = tokio::time::interval_at(
+        previous_time.checked_add(period).unwrap_or(previous_time),
+        period,
+    );
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let current = match backend.counters() {
+            | Ok(counters) => counters,
+            | Err(failure) => return write(&stopped(&failure)),
+        };
+        let now = tokio::time::Instant::now();
+        if let crate::oplog::Throughput::Active(record) =
+            crate::oplog::throughput(&previous, &current, now.duration_since(previous_time))
+        {
+            write(&record);
+        }
+        previous = current;
+        previous_time = now;
+    }
 }
 
 /// The router.
@@ -838,7 +976,11 @@ fn router(
 ) -> axum::Router
 {
     let limit = config.max_request.0.get();
-    let shared = Arc::new(Shared { backend, config });
+    let shared = Arc::new(Shared {
+        backend,
+        config,
+        requests: core::sync::atomic::AtomicU64::new(0),
+    });
     return axum::Router::new()
         .route("/health", axum::routing::get(health))
         .route("/v1/models", axum::routing::get(models))
@@ -907,6 +1049,15 @@ mod tests
             return &self.0;
         }
 
+        /// No activity.
+        ///
+        /// # Specification
+        /// trivial.
+        fn counters(&self) -> Result<infinitum_chat::RuntimeCounters, ChatFailure>
+        {
+            return Ok(infinitum_chat::RuntimeCounters::default());
+        }
+
         /// Answer "ab", streaming it as two deltas, or fail before
         /// submission when the first turn says "fail".
         ///
@@ -942,9 +1093,12 @@ mod tests
                 prompt_tokens: TokenCount::from(3_u32),
                 reused_tokens: TokenCount::ZERO,
             };
+            events.submitted(infinitum_chat::Submission {
+                thinking: infinitum_chat::Thinking::Closed,
+                thinking_budget: infinitum_chat::ThinkingBudget::Unlimited,
+            });
+            events.admitted(admission);
             if request.delivery == Delivery::Streaming {
-                events.submitted();
-                events.admitted(admission);
                 events.publish(Channel::Content, DeltaText("a"));
                 events.publish(Channel::Content, DeltaText("b"));
             }
@@ -960,6 +1114,20 @@ mod tests
                 generation_wall: core::time::Duration::ZERO,
                 drafted: Tally(0),
                 accepted: Tally(0),
+                telemetry: infinitum_chat::Telemetry {
+                    first_token: core::time::Duration::ZERO,
+                    total: core::time::Duration::ZERO,
+                    prefill: core::time::Duration::ZERO,
+                    decode: core::time::Duration::ZERO,
+                    queue_wait: core::time::Duration::ZERO,
+                    reuse: infinitum_chat::ReusePath::Root,
+                    thinking: infinitum_chat::ThinkingSpend {
+                        budget: infinitum_chat::ThinkingBudget::Unlimited,
+                        model_tokens: TokenCount::ZERO,
+                        injected_tokens: TokenCount::ZERO,
+                    },
+                    accepted_per_position: Vec::new(),
+                },
             });
         }
     }
@@ -981,6 +1149,7 @@ mod tests
                     thinking_budget: infinitum_chat::ThinkingBudget::Unlimited,
                 },
                 max_request: RequestBytes(core::num::NonZeroUsize::new(1024).unwrap()),
+                stats: super::StatsInterval::Off,
             },
         );
     }
@@ -1030,6 +1199,15 @@ mod tests
             return &self.0;
         }
 
+        /// No activity.
+        ///
+        /// # Specification
+        /// trivial.
+        fn counters(&self) -> Result<infinitum_chat::RuntimeCounters, ChatFailure>
+        {
+            return Ok(infinitum_chat::RuntimeCounters::default());
+        }
+
         /// Succeed exactly for four aggregate tokens that neither read nor
         /// write the prefix cache.
         ///
@@ -1074,6 +1252,20 @@ mod tests
                 generation_wall: core::time::Duration::ZERO,
                 drafted: Tally(0),
                 accepted: Tally(0),
+                telemetry: infinitum_chat::Telemetry {
+                    first_token: core::time::Duration::ZERO,
+                    total: core::time::Duration::ZERO,
+                    prefill: core::time::Duration::ZERO,
+                    decode: core::time::Duration::ZERO,
+                    queue_wait: core::time::Duration::ZERO,
+                    reuse: infinitum_chat::ReusePath::Root,
+                    thinking: infinitum_chat::ThinkingSpend {
+                        budget: infinitum_chat::ThinkingBudget::Unlimited,
+                        model_tokens: TokenCount::ZERO,
+                        injected_tokens: TokenCount::ZERO,
+                    },
+                    accepted_per_position: Vec::new(),
+                },
             });
         }
     }
@@ -1219,6 +1411,108 @@ mod tests
         assert!(
             body.contains(r#""code":"request_too_large""#) && body.contains("limit of 1024 bytes"),
             "the refusal is ninfer's: {body}"
+        );
+    }
+
+    /// A backend whose counter samples are scripted, oldest first.
+    struct Sampled
+    {
+        /// Its name.
+        model: ModelName,
+        /// The samples still to give.
+        samples: std::sync::Mutex<Vec<Result<infinitum_chat::RuntimeCounters, ChatFailure>>>,
+    }
+
+    impl ChatBackend for Sampled
+    {
+        /// Its name.
+        ///
+        /// # Specification
+        /// trivial.
+        fn model_name(&self) -> &ModelName
+        {
+            return &self.model;
+        }
+
+        /// The next scripted sample; a failure once the script is spent.
+        ///
+        /// # Specification
+        /// trivial.
+        fn counters(&self) -> Result<infinitum_chat::RuntimeCounters, ChatFailure>
+        {
+            let spent = ChatFailure {
+                kind: FailureKind::Internal,
+                message: String::from("script spent"),
+            };
+            return match self.samples.lock() {
+                | Ok(mut samples) if !samples.is_empty() => samples.remove(0),
+                | _ => Err(spent),
+            };
+        }
+
+        /// Refuse; the reporter never runs a request.
+        ///
+        /// # Specification
+        /// trivial.
+        fn run(
+            &self,
+            _request: &ChatRequest,
+            _events: &mut dyn ChatEvents,
+            _cancel: &CancelToken,
+        ) -> Result<ChatOutcome, ChatFailure>
+        {
+            return Err(ChatFailure {
+                kind: FailureKind::Internal,
+                message: String::from("not a chat backend"),
+            });
+        }
+    }
+
+    /// A quiet interval writes nothing, an active one writes its line over the
+    /// full period, and a failed sample writes one warning and ends the
+    /// reporter.
+    #[tokio::test(start_paused = true)]
+    async fn throughput_reports_active_intervals_until_a_sample_fails()
+    {
+        let idle = infinitum_chat::RuntimeCounters::default();
+        let busy = infinitum_chat::RuntimeCounters {
+            decode_tokens: Tally(50),
+            ..idle
+        };
+        let backend = Sampled {
+            model: ModelName(String::from("m")),
+            samples: std::sync::Mutex::new(vec![
+                Ok(idle),
+                Ok(idle),
+                Ok(busy),
+                Err(ChatFailure {
+                    kind: FailureKind::Internal,
+                    message: String::from("gone"),
+                }),
+            ]),
+        };
+        let mut lines = Vec::new();
+        super::report_throughput(
+            Arc::new(backend),
+            core::time::Duration::from_secs(5),
+            |record: &crate::oplog::Record| lines.push(record.clone()),
+        )
+        .await;
+        assert_eq!(
+            lines,
+            [
+                crate::oplog::Record {
+                    severity: crate::oplog::Severity::Info,
+                    message: String::from(
+                        "throughput | 5.0s | decode 10.0 tok/s (50 tok) | running 0 | host 0.0% (0 us)"
+                    ),
+                },
+                crate::oplog::Record {
+                    severity: crate::oplog::Severity::Warning,
+                    message: String::from("throughput reporting stopped | gone"),
+                },
+            ],
+            "one active line, then the warning"
         );
     }
 }

@@ -16,10 +16,12 @@ namespace infinitum::ninfer {
 
 // Shared with Rust; the bridge's generated header defines them.
 struct CancelFlag;
+struct CapacityRecord;
 struct ChatPrompt;
 struct ChatRecord;
 struct ChatSettings;
 struct ChatSink;
+struct CounterRecord;
 struct EngineConfig;
 struct GenerationRecord;
 struct Outcome;
@@ -114,13 +116,42 @@ void detokenize(const Session& session, rust::Slice<const std::int32_t> ids,
 /// - panics: none.
 void model_name(const Session& session, rust::String& name, Outcome& outcome) noexcept;
 
+/// Read the Engine's resolved capacities, as ninfer's server logs them at startup.
+///
+/// # Specification
+/// - requires: `session` is open.
+/// - ensures: on success `record` holds the Engine's memory summary's KV capacity, storage,
+///   sizing, page groups, runtime reservation and free bytes, and its effective context-cache
+///   options, the cache counts zero when the cache is disabled; `outcome.status` is `Completed`.
+/// - provides: the startup capacity lines.
+/// - fails: when ninfer throws; reported through `outcome`, never thrown.
+/// - panics: none.
+void capacity(const Session& session, CapacityRecord& record, Outcome& outcome) noexcept;
+
+/// Read the Engine's runtime counters.
+///
+/// # Specification
+/// - requires: `session` is open.
+/// - ensures: on success `record` holds the Engine's published runtime statistics: token and
+///   decode totals, request gauges, host-active nanoseconds summed as ninfer's server sums them,
+///   and a digest over every other field its server compares for activity; `outcome.status` is
+///   `Completed`.
+/// - provides: the throughput report's samples.
+/// - fails: when ninfer throws; reported through `outcome`, never thrown.
+/// - panics: none.
+void counters(const Session& session, CounterRecord& record, Outcome& outcome) noexcept;
+
 /// Run one chat request: render and prepare `prompt`, submit it with `settings`, and wait for
-/// its result, publishing to `sink` when streaming and reviewing every round through `review`.
+/// its result, telling `sink` of the submission, publishing to it when streaming, and reviewing
+/// every round through `review`.
 ///
 /// # Specification
 /// - requires: `session` is open; `sink`, `cancel` and `review` outlive the call.
 /// - ensures: on success `record` holds ninfer's content, reasoning, tool calls, finish reason,
-///   prompt accounting, generated ids, reasoning count, phase times and speculative tallies, and
+///   prompt accounting, generated ids, reasoning count, phase times, speculative tallies with
+///   per-position acceptance, times to first token and end measured from the call as ninfer's
+///   server measures them, queue wait, reuse source and thinking spend, and `sink` was told of
+///   the submission, whether the turn opens in thinking and its budget, before admission;
 ///   `outcome.status` is `Completed`; a refusal sets `Refused` and its class. `sink` is reached
 ///   only on the calling thread and only before return; `cancel` only through cancellation views
 ///   passed to calls that end before return; `review` only through a controller detached before

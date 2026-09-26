@@ -120,7 +120,8 @@ features = ["preserve_order", "std"]
 # streams through. `rt-multi-thread` runs the server, `net` binds the
 # listener, `sync` carries deltas and the stream's start to the response,
 # `time` paces the stream's keep-alive comments; signals and file I/O are
-# unused. The serve crate's tests add `macros` for `#[tokio::test]`.
+# unused. The serve crate's tests add `macros` for `#[tokio::test]` and
+# `test-util` to pause the clock under the throughput reporter.
 # consumers:
 # - infinitum (feature `ninfer`)
 # - infinitum-serve

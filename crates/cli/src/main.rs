@@ -423,6 +423,31 @@ mod tests
         );
     }
 
+    /// A zero stats interval turns reporting off, any other count is that
+    /// many milliseconds, and a negative one is refused.
+    #[test]
+    fn stats_interval_zero_turns_reporting_off()
+    {
+        use core::str::FromStr as _;
+
+        assert_eq!(
+            crate::serve::StatsPeriod::from_str("0"),
+            Ok(crate::serve::StatsPeriod::Off),
+            "zero"
+        );
+        assert_eq!(
+            crate::serve::StatsPeriod::from_str("1"),
+            Ok(crate::serve::StatsPeriod::Every(
+                core::time::Duration::from_millis(1)
+            )),
+            "one millisecond"
+        );
+        assert!(
+            crate::serve::StatsPeriod::from_str("-1").is_err(),
+            "negative"
+        );
+    }
+
     /// Each serving limit refuses zero before anything runs, and the body cap
     /// refuses a MiB count whose bytes overflow `usize`.
     #[test]

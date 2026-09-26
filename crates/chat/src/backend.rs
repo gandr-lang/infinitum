@@ -94,13 +94,17 @@ pub trait ChatEvents
     /// failure after it ends a response already begun.
     ///
     /// # Specification
-    /// - requires: called at most once per request, before
-    ///   [`ChatEvents::admitted`].
+    /// - requires: called exactly once per submitted request, before
+    ///   [`ChatEvents::admitted`], with what preparation decided.
     /// - ensures: implementation-defined.
-    /// - provides: the point a streamed response may begin.
+    /// - provides: the point a streamed response may begin, and the request's
+    ///   start record.
     /// - fails: never; as for [`ChatEvents::admitted`].
     /// - panics: none.
-    fn submitted(&mut self);
+    fn submitted(
+        &mut self,
+        submission: Submission,
+    );
 
     /// The request was admitted with this prompt accounting; called once,
     /// before any delta.
@@ -131,6 +135,27 @@ pub trait ChatEvents
         channel: Channel,
         text: DeltaText<'_>,
     );
+}
+
+/// Whether the rendered assistant turn opens in thinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Thinking
+{
+    /// It opens in the answer.
+    Closed,
+    /// It opens in thinking.
+    Open,
+}
+
+/// What preparation decided about a submitted request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Submission
+{
+    /// Whether the turn opens in thinking.
+    pub thinking: Thinking,
+    /// The thinking budget it runs under; unlimited when the turn does not
+    /// open in thinking.
+    pub thinking_budget: crate::request::ThinkingBudget,
 }
 
 /// How a request failed.
@@ -222,6 +247,19 @@ pub trait ChatBackend: Send + Sync
         events: &mut dyn ChatEvents,
         cancel: &CancelToken,
     ) -> Result<ChatOutcome, ChatFailure>;
+    /// A snapshot of the backend's runtime counters.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: every cumulative total is at least its value in any earlier
+    ///   snapshot.
+    /// - provides: the throughput report's samples.
+    /// - fails: when the backend cannot read its counters.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`ChatFailure`]: the counters could not be read.
+    fn counters(&self) -> Result<crate::RuntimeCounters, ChatFailure>;
 }
 
 /// Tests for the cancellation flag.

@@ -99,6 +99,10 @@ pub struct Server
     /// with 413 before it is parsed.
     #[arg(long, value_name = "MIB", default_value = "384")]
     max_request_mib: RequestMib,
+    /// How often throughput is logged, for intervals that saw activity; 0
+    /// never logs it.
+    #[arg(long, value_name = "MILLISECONDS", default_value = "5000")]
+    log_stats_interval_ms: StatsPeriod,
     /// The CUDA device ordinal.
     #[arg(long, value_name = "ORDINAL", default_value = "0")]
     device: DeviceOrdinal,
@@ -149,6 +153,50 @@ impl core::str::FromStr for OutputTokens
     fn from_str(text: &str) -> Result<Self, Self::Err>
     {
         return text.parse::<core::num::NonZeroU32>().map(Self);
+    }
+}
+
+/// How often the server logs throughput.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsPeriod
+{
+    /// Never.
+    Off,
+    /// At this period.
+    Every(core::time::Duration),
+}
+
+impl core::str::FromStr for StatsPeriod
+{
+    type Err = core::num::ParseIntError;
+
+    /// Parse a non-negative decimal count of milliseconds.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success zero is [`StatsPeriod::Off`] and any other count
+    ///   that many milliseconds, as ninfer's `--log-stats-interval-ms` reads
+    ///   it.
+    /// - provides: `--log-stats-interval-ms`.
+    /// - fails: with the integer parser's error on a negative value, anything
+    ///   above `u32::MAX`, or a non-numeric string.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`core::num::ParseIntError`]: `text` is not a `u32`.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at the zero boundary.
+    /// - witness: `crate::tests::stats_interval_zero_turns_reporting_off`
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        let milliseconds = text.parse::<u32>()?;
+        return Ok(if milliseconds == 0 {
+            Self::Off
+        }
+        else {
+            Self::Every(core::time::Duration::from_millis(u64::from(milliseconds)))
+        });
     }
 }
 
@@ -446,6 +494,7 @@ where
     use infinitum_chat::ChatBackend as _;
 
     let engine = infinitum_ninfer::ChatEngine::open(options, plan).map_err(ServeFailure::Engine)?;
+    infinitum_serve::log_capacity(&engine.capacity().map_err(ServeFailure::Engine)?);
     let thinking_budget = server.default_thinking_budget.map_or(
         infinitum_chat::ThinkingBudget::Unlimited,
         |budget| {
@@ -474,6 +523,10 @@ where
             thinking_budget,
         },
         max_request: infinitum_serve::RequestBytes(server.max_request_mib.0),
+        stats: match server.log_stats_interval_ms {
+            | StatsPeriod::Off => infinitum_serve::StatsInterval::Off,
+            | StatsPeriod::Every(period) => infinitum_serve::StatsInterval::Every(period),
+        },
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_io()

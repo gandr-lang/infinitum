@@ -441,6 +441,24 @@ pub mod ffi
         arguments: String,
     }
 
+    /// Where an admitted prompt's reused prefix came from.
+    #[derive(Debug)]
+    enum ReuseSource
+    {
+        /// The root.
+        Root,
+        /// A private endpoint.
+        PrivateEndpoint,
+        /// A private turn closure.
+        TurnClosure,
+        /// A private response replay.
+        ResponseReplay,
+        /// A private long anchor.
+        LongAnchor,
+        /// A shared stable prefix.
+        SharedPrefix,
+    }
+
     /// What one chat request produced.
     #[derive(Debug)]
     struct ChatRecord
@@ -469,6 +487,98 @@ pub mod ffi
         drafted: u64,
         /// Drafted tokens accepted.
         accepted: u64,
+        /// Arrival to first output token, in nanoseconds, as ninfer's server
+        /// reports time to first token.
+        first_token_ns: u64,
+        /// Arrival to end, in nanoseconds.
+        total_ns: u64,
+        /// Prefill execution, in nanoseconds.
+        prefill_ns: u64,
+        /// Decode execution, in nanoseconds.
+        decode_ns: u64,
+        /// Waiting for admission, in nanoseconds.
+        queue_wait_ns: u64,
+        /// Where the reused prefix came from.
+        reuse: ReuseSource,
+        /// The configured thinking budget; zero for none.
+        thinking_budget: u32,
+        /// Model tokens accepted while budgeted thinking stayed open.
+        thinking_model_tokens: u32,
+        /// Control tokens injected to close thinking.
+        thinking_injected_tokens: u32,
+        /// Accepted drafted tokens per draft position.
+        accepted_per_position: Vec<u64>,
+    }
+
+    /// The Engine's resolved capacities, as ninfer's server logs them at
+    /// startup.
+    #[derive(Debug)]
+    struct CapacityRecord
+    {
+        /// Main KV capacity in tokens, page aligned.
+        kv_tokens: u32,
+        /// The KV storage.
+        kv_storage: KvStorage,
+        /// How the capacity was sized.
+        kv_sizing: KvSizing,
+        /// KV page groups in use.
+        pages: u32,
+        /// KV page groups at most.
+        max_pages: u32,
+        /// The runtime reservation in bytes.
+        runtime_bytes: u64,
+        /// Device bytes free after startup.
+        free_bytes: u64,
+        /// Whether the context cache is enabled; the counts below are zero
+        /// when not.
+        cache_enabled: bool,
+        /// Active lanes.
+        lanes: u32,
+        /// Device checkpoint slots beyond the lanes.
+        device_states: u32,
+        /// Host checkpoint slots.
+        host_states: u32,
+        /// Host KV capacity in bytes.
+        host_kv_bytes: u64,
+        /// Private continuations.
+        private_continuations: u32,
+        /// Shared prefixes.
+        shared_prefixes: u32,
+        /// Long anchors per continuation.
+        long_anchors: u32,
+    }
+
+    /// One snapshot of the Engine's runtime counters.
+    #[derive(Debug)]
+    struct CounterRecord
+    {
+        /// Prompt tokens prefill evaluated.
+        prefill_tokens: u64,
+        /// Tokens decode rounds committed.
+        decode_tokens: u64,
+        /// Decode batches run.
+        decode_rounds: u64,
+        /// Rows over every decode batch.
+        decode_rows: u64,
+        /// Running requests.
+        running: u32,
+        /// Running requests prefilling.
+        prefilling: u32,
+        /// Running requests ready to decode.
+        decode_ready: u32,
+        /// Waiting requests.
+        waiting: u32,
+        /// Materializing requests.
+        materializing: u32,
+        /// Requests waiting on a capture.
+        capture_pending: u32,
+        /// Requests awaiting their terminal record.
+        terminal_pending: u32,
+        /// Host-active nanoseconds, cumulative.
+        host_active_ns: u64,
+        /// A digest of every other field ninfer's server compares to decide
+        /// whether an interval saw activity.
+        digest: u64,
     }
 
     /// The channel a published delta belongs to.
@@ -498,8 +608,14 @@ pub mod ffi
             kind: RoundKind,
         ) -> ReviewAnswer;
 
-        /// The request passed preparation and was submitted.
-        fn chat_submitted(sink: &mut ChatSink<'_>);
+        /// The request passed preparation and was submitted; the turn opens
+        /// in thinking when `thinking_open`, under `thinking_budget` tokens,
+        /// zero for none.
+        fn chat_submitted(
+            sink: &mut ChatSink<'_>,
+            thinking_open: bool,
+            thinking_budget: u32,
+        );
 
         /// The request was admitted.
         fn chat_admitted(
@@ -564,6 +680,20 @@ pub mod ffi
         fn model_name(
             session: &Session,
             name: &mut String,
+            outcome: &mut Outcome,
+        );
+
+        /// Read the Engine's resolved capacities.
+        fn capacity(
+            session: &Session,
+            record: &mut CapacityRecord,
+            outcome: &mut Outcome,
+        );
+
+        /// Read the Engine's runtime counters.
+        fn counters(
+            session: &Session,
+            record: &mut CounterRecord,
             outcome: &mut Outcome,
         );
 
