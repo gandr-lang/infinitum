@@ -1,6 +1,6 @@
 # infinitum-ninfer
 
-The ninfer backend of the [infinitum](https://github.com/gandr-lang/infinitum) engine.
+The ninfer backend of the [infinitum](https://github.com/silvanshade-org/infinitum) engine.
 
 ## Planning
 

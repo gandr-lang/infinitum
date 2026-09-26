@@ -1,6 +1,6 @@
 # infinitum-round
 
-The speculative round as [infinitum](https://github.com/gandr-lang/infinitum) describes it: a graph of typed fragments, the components that emit them, the contract a backend plans them under, and the host's decision between a round's execute and commit phases. Engine-neutral: no backend is linked here.
+The speculative round as [infinitum](https://github.com/silvanshade-org/infinitum) describes it: a graph of typed fragments, the components that emit them, the contract a backend plans them under, and the host's decision between a round's execute and commit phases. Engine-neutral: no backend is linked here.
 
 ## The round
 
