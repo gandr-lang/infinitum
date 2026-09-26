@@ -1,5 +1,5 @@
 //! How an Engine is opened: the artifact, the device, the context ceiling,
-//! CUDA graph capture, and the chat template.
+//! the pending timeout, CUDA graph capture, and the chat template.
 
 /// The logical ceiling of one request in tokens, prompt and generation
 /// together. The Engine also sizes its KV cache from it, so a small ceiling
@@ -42,6 +42,62 @@ impl core::str::FromStr for ContextLimit
     /// - hypothesis: L3 at the zero boundary, the one decision the wrapper adds
     ///   to `u32` parsing.
     /// - witness: `tests::a_zero_context_is_refused`
+    #[inline]
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        return text.parse::<core::num::NonZeroU32>().map(Self);
+    }
+}
+
+/// How long a request may wait for admission, in milliseconds; past it the
+/// Engine refuses the request with a queue timeout.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingTimeout(core::num::NonZeroU32);
+
+impl PendingTimeout
+{
+    /// ninfer's default: thirty seconds.
+    pub const DEFAULT: Self = Self(match core::num::NonZeroU32::new(30_000) {
+        | Some(milliseconds) => milliseconds,
+        | None => core::num::NonZeroU32::MIN,
+    });
+}
+
+impl From<PendingTimeout> for core::num::NonZeroU32
+{
+    /// Unwrap the timeout's milliseconds.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn from(timeout: PendingTimeout) -> Self
+    {
+        return timeout.0;
+    }
+}
+
+impl core::str::FromStr for PendingTimeout
+{
+    type Err = core::num::ParseIntError;
+
+    /// Parse a positive decimal count of milliseconds.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the timeout is the parsed value, at least one.
+    /// - provides: the command-line spelling of a pending timeout, refusing
+    ///   zero as ninfer's server does.
+    /// - fails: with the integer parser's error on zero, a negative value,
+    ///   anything above `u32::MAX`, or a non-numeric string.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`core::num::ParseIntError`]: `text` is not a positive `u32`.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at the zero boundary.
+    /// - witness: `tests::a_zero_pending_timeout_is_refused`
     #[inline]
     fn from_str(text: &str) -> Result<Self, Self::Err>
     {
@@ -181,6 +237,8 @@ pub struct EngineOptions
     device: DeviceOrdinal,
     /// The context ceiling.
     context: ContextLimit,
+    /// The pending timeout.
+    pending_timeout: PendingTimeout,
     /// CUDA graph capture.
     cuda_graph: CudaGraph,
     /// The chat template.
@@ -189,7 +247,8 @@ pub struct EngineOptions
 
 impl EngineOptions
 {
-    /// Gather the options, with the artifact's own chat template.
+    /// Gather the options, with the artifact's own chat template and ninfer's
+    /// default pending timeout.
     ///
     /// # Specification
     /// trivial.
@@ -206,9 +265,39 @@ impl EngineOptions
             artifact,
             device,
             context,
+            pending_timeout: PendingTimeout::DEFAULT,
             cuda_graph,
             chat_template: ChatTemplate::Artifact,
         };
+    }
+
+    /// The same options with `timeout` bounding each request's wait for
+    /// admission.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub fn with_pending_timeout(
+        self,
+        timeout: PendingTimeout,
+    ) -> Self
+    {
+        return Self {
+            pending_timeout: timeout,
+            ..self
+        };
+    }
+
+    /// The pending timeout.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn pending_timeout(&self) -> PendingTimeout
+    {
+        return self.pending_timeout;
     }
 
     /// The same options with `template` rendering chat prompts.
@@ -293,6 +382,7 @@ mod tests
     use super::ContextLimit;
     use super::CudaGraph;
     use super::DeviceOrdinal;
+    use super::PendingTimeout;
     use super::UnknownCudaGraph;
 
     /// A zero ceiling is refused and one is admitted.
@@ -306,6 +396,21 @@ mod tests
         assert!(
             ContextLimit::from_str("1").is_ok(),
             "one token is a ceiling"
+        );
+    }
+
+    /// A zero timeout is refused, as ninfer's server refuses it; one
+    /// millisecond is admitted.
+    #[test]
+    fn a_zero_pending_timeout_is_refused()
+    {
+        assert!(
+            PendingTimeout::from_str("0").is_err(),
+            "a request needs time to be admitted"
+        );
+        assert!(
+            PendingTimeout::from_str("1").is_ok(),
+            "one millisecond is a timeout"
         );
     }
 

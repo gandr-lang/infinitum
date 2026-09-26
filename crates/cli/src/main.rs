@@ -367,6 +367,55 @@ mod tests
         );
     }
 
+    /// Each serving limit refuses zero before anything runs, and the body cap
+    /// refuses a MiB count whose bytes overflow `usize`.
+    #[test]
+    fn serve_limits_refuse_zero()
+    {
+        for flag in [
+            "--default-max-tokens",
+            "--pending-timeout-ms",
+            "--max-request-mib",
+        ] {
+            let parsed = <Cli as clap::Parser>::try_parse_from([
+                "infinitum",
+                "serve",
+                "--artifact",
+                "model.ninfer",
+                flag,
+                "0",
+            ]);
+            assert_eq!(
+                parsed.unwrap_err().kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{flag} 0 is refused as a value"
+            );
+        }
+        let overflowing = (usize::MAX >> 20_u32).saturating_add(1).to_string();
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "infinitum",
+            "serve",
+            "--artifact",
+            "model.ninfer",
+            "--max-request-mib",
+            overflowing.as_str(),
+        ]);
+        assert!(parsed.is_err(), "a cap whose bytes overflow is refused");
+        let largest = (usize::MAX >> 20_u32).to_string();
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "infinitum",
+            "serve",
+            "--artifact",
+            "model.ninfer",
+            "--max-request-mib",
+            largest.as_str(),
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "the largest cap whose bytes fit is accepted"
+        );
+    }
+
     /// A zero token budget is an argument error, before anything runs.
     #[test]
     fn a_zero_budget_is_an_argument_error()
