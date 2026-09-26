@@ -16,6 +16,7 @@ All notable changes to infinitum are documented here.
 - _(engine)_ Scale RoPE positions for served long context (#14)
 - _(engine)_ Default serve's thinking budget (#15)
 - _(serve)_ Log operations as ninfer's server does (#16)
+- _(serve)_ Stream timings_per_token and return_progress as ninfer does (#18)
 
 ### Unreleased Bug Fixes
 
