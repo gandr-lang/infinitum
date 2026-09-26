@@ -12,6 +12,7 @@ mod backend;
 mod outcome;
 mod request;
 mod runtime;
+mod startup;
 
 pub use backend::CancelToken;
 pub use backend::Cancellation;
@@ -69,3 +70,9 @@ pub use runtime::KvSizing;
 pub use runtime::LoadReport;
 pub use runtime::RequestGauges;
 pub use runtime::RuntimeCounters;
+pub use startup::StartupAmount;
+pub use startup::StartupEvent;
+pub use startup::StartupObserver;
+pub use startup::StartupPhase;
+pub use startup::StartupStatus;
+pub use startup::Unobserved;

@@ -14,6 +14,11 @@ use infinitum_chat::DeltaText;
 use infinitum_chat::Effort;
 use infinitum_chat::Finish;
 use infinitum_chat::ReusePath;
+use infinitum_chat::StartupAmount;
+use infinitum_chat::StartupEvent;
+use infinitum_chat::StartupObserver;
+use infinitum_chat::StartupPhase;
+use infinitum_chat::StartupStatus;
 use infinitum_chat::Submission;
 use infinitum_chat::Switch;
 use infinitum_chat::Thinking;
@@ -1064,22 +1069,447 @@ pub fn throughput(
     });
 }
 
-/// Log the start of opening the Engine.
+/// The level ninfer's startup log writes a phase's lines at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shown
+{
+    /// Info: the phase's completion, and its beginning when long.
+    Info,
+    /// Debug only, which this log does not write.
+    Debug,
+}
+
+/// Whether a phase may run long enough that ninfer announces its beginning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Span
+{
+    /// It may.
+    Long,
+    /// It is brief.
+    Brief,
+}
+
+/// Whether a phase's completion line carries its byte rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rate
+{
+    /// It does.
+    Shown,
+    /// It does not.
+    Omitted,
+}
+
+/// How ninfer's startup log presents one phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Presentation
+{
+    /// The phase while it runs.
+    active: &'static str,
+    /// The phase once complete.
+    complete: &'static str,
+    /// Its lines' level.
+    shown: Shown,
+    /// Whether its beginning is announced.
+    span: Span,
+    /// Whether its completion carries a rate.
+    rate: Rate,
+}
+
+/// How ninfer's startup log presents `phase`.
 ///
 /// # Specification
 /// - requires: nothing.
-/// - ensures: `starting engine` is written at info, as ninfer's startup log
-///   writes it when the Engine phase begins.
-/// - provides: the first startup line.
-/// - fails: never; a failed write is dropped as every log write is.
+/// - ensures: the words, level, span and rate of ninfer's `phase_presentation`.
+/// - provides: every startup line's wording.
+/// - fails: never.
 /// - panics: none.
-#[inline]
-pub fn log_engine_start()
+const fn presentation(phase: StartupPhase) -> Presentation
 {
-    emit(&Record {
-        severity: Severity::Info,
-        message: String::from("starting engine"),
-    });
+    let (active, complete, shown, span, rate) = match phase {
+        | StartupPhase::EngineStartup => (
+            "starting engine",
+            "engine startup",
+            Shown::Info,
+            Span::Long,
+            Rate::Omitted,
+        ),
+        | StartupPhase::CudaInitialize => (
+            "initializing CUDA",
+            "CUDA initialized",
+            Shown::Debug,
+            Span::Brief,
+            Rate::Omitted,
+        ),
+        | StartupPhase::ArtifactInspect => (
+            "inspecting artifact",
+            "artifact inspected",
+            Shown::Debug,
+            Span::Brief,
+            Rate::Omitted,
+        ),
+        | StartupPhase::TargetPlan => (
+            "planning runtime",
+            "runtime planned",
+            Shown::Debug,
+            Span::Brief,
+            Rate::Omitted,
+        ),
+        | StartupPhase::WeightsMaterialize => (
+            "loading weights",
+            "weights ready",
+            Shown::Info,
+            Span::Long,
+            Rate::Shown,
+        ),
+        | StartupPhase::WeightsStagingPin => (
+            "pinning staging buffers",
+            "staging buffers pinned",
+            Shown::Debug,
+            Span::Brief,
+            Rate::Omitted,
+        ),
+        | StartupPhase::TargetFinalize => (
+            "finalizing target",
+            "target finalized",
+            Shown::Debug,
+            Span::Brief,
+            Rate::Omitted,
+        ),
+        | StartupPhase::FrontendInitialize => (
+            "initializing frontend",
+            "frontend ready",
+            Shown::Debug,
+            Span::Brief,
+            Rate::Omitted,
+        ),
+        | StartupPhase::ProgramInitialize => (
+            "initializing runtime",
+            "runtime initialized",
+            Shown::Debug,
+            Span::Brief,
+            Rate::Omitted,
+        ),
+        | StartupPhase::HostStatePin => (
+            "pinning host state",
+            "host state pinned",
+            Shown::Info,
+            Span::Long,
+            Rate::Omitted,
+        ),
+        | StartupPhase::HostKvPin => (
+            "pinning host KV",
+            "host KV pinned",
+            Shown::Info,
+            Span::Long,
+            Rate::Omitted,
+        ),
+        | StartupPhase::CudaGraphPrepare => (
+            "preparing CUDA graphs",
+            "CUDA graphs ready",
+            Shown::Info,
+            Span::Brief,
+            Rate::Omitted,
+        ),
+        | StartupPhase::EngineFinalize => (
+            "finalizing engine",
+            "engine finalized",
+            Shown::Debug,
+            Span::Brief,
+            Rate::Omitted,
+        ),
+    };
+    return Presentation {
+        active,
+        complete,
+        shown,
+        span,
+        rate,
+    };
+}
+
+/// How long ninfer's persistent startup log waits between one phase's
+/// progress lines.
+const PROGRESS_INTERVAL: core::time::Duration = core::time::Duration::from_secs(10);
+
+/// One running phase's progress clock, as ninfer keeps it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PhaseClock
+{
+    /// The phase.
+    phase: StartupPhase,
+    /// When the last progress line was written, or the phase began.
+    written: std::time::Instant,
+    /// When the rate was last sampled.
+    sampled: std::time::Instant,
+    /// The bytes done at that sample.
+    sampled_bytes: u64,
+    /// The smoothed byte rate, zero until a sample advances.
+    rate: f64,
+}
+
+impl PhaseClock
+{
+    /// Fold one progress report into the smoothed rate.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: as ninfer's `update_rate`: when the bytes grew over a
+    ///   positive interval, the rate is the instantaneous rate, or a quarter of
+    ///   it plus three quarters of the previous rate once there is one; the
+    ///   sample moves to `now` and `done` either way.
+    /// - provides: the progress line's rate and ETA.
+    /// - fails: never.
+    /// - panics: none.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        reason = "a rate is a float, as ninfer's is, and ninfer rounds each product separately"
+    )]
+    fn sample(
+        &mut self,
+        done: infinitum_chat::ByteSize,
+        now: std::time::Instant,
+    )
+    {
+        let infinitum_chat::ByteSize(done) = done;
+        let seconds = now.saturating_duration_since(self.sampled).as_secs_f64();
+        if done >= self.sampled_bytes && seconds > 0.0_f64 {
+            let instantaneous = done.saturating_sub(self.sampled_bytes) as f64 / seconds;
+            if instantaneous > 0.0_f64 {
+                self.rate = if self.rate > 0.0_f64 {
+                    0.25_f64 * instantaneous + 0.75_f64 * self.rate
+                }
+                else {
+                    instantaneous
+                };
+            }
+        }
+        self.sampled = now;
+        self.sampled_bytes = done;
+    }
+}
+
+/// Whether the startup failure line was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureLine
+{
+    /// Not yet.
+    Unwritten,
+    /// Once; ninfer writes one.
+    Written,
+}
+
+/// ninfer's startup log for a non-interactive stderr: the lines its
+/// `StartupLogRenderer` writes at info when no terminal takes its progress
+/// bar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StartupLog
+{
+    /// The clock of each phase that began.
+    clocks: Vec<PhaseClock>,
+    /// Whether the failure line was written.
+    failure: FailureLine,
+}
+
+impl Default for StartupLog
+{
+    /// A log before any phase.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn default() -> Self
+    {
+        return Self {
+            clocks: Vec::new(),
+            failure: FailureLine::Unwritten,
+        };
+    }
+}
+
+impl StartupLog
+{
+    /// The line one startup report writes at `now`, if any.
+    ///
+    /// # Specification
+    /// - requires: reports arrive in order, with non-decreasing `now`.
+    /// - ensures: as ninfer's renderer with a non-interactive stderr, at info:
+    ///   the Engine phase's beginning writes `starting engine`, and its
+    ///   completion nothing; a long info phase's beginning writes its name,
+    ///   with ` | <total>` when it counts bytes and knows the total; a
+    ///   byte-counted report at least ten seconds after the phase began or last
+    ///   wrote progress writes `  <name> <percent> | <done>/<total>`, then ` |
+    ///   <rate>/s` once a rate is known and ` | ETA <duration>` while bytes
+    ///   remain; an info phase's completion writes `<done name>`, then ` |
+    ///   <bytes>` when it counts bytes (done, or the total when none is
+    ///   reported), ` | <duration>`, and for weights ` | <rate>/s` over the
+    ///   phase; the first failure writes `startup failed | <name> | <duration>`
+    ///   at error. Every other report, the debug-level ones included, writes
+    ///   nothing.
+    /// - provides: the startup lines before `engine ready`.
+    /// - fails: never.
+    /// - panics: none.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 on each status, the progress interval, the rate and
+    ///   ETA, the level split, and the one failure line.
+    /// - witness: `tests::startup_phases_log_as_ninfers`
+    #[inline]
+    #[must_use]
+    pub fn line(
+        &mut self,
+        event: StartupEvent,
+        now: std::time::Instant,
+    ) -> Throughput
+    {
+        let shape = presentation(event.phase);
+        let (bytes, total) = match event.amount {
+            | StartupAmount::Bytes { done, total } => (Some(done.0), total.0),
+            | StartupAmount::Untracked => (None, 0),
+        };
+        let info = |message: String| {
+            return Throughput::Active(Record {
+                severity: Severity::Info,
+                message,
+            });
+        };
+        match event.status {
+            | StartupStatus::Begin => {
+                let clock = PhaseClock {
+                    phase: event.phase,
+                    written: now,
+                    sampled: now,
+                    sampled_bytes: 0,
+                    rate: 0.0_f64,
+                };
+                match self
+                    .clocks
+                    .iter_mut()
+                    .find(|known| return known.phase == event.phase)
+                {
+                    | Some(known) => *known = clock,
+                    | None => self.clocks.push(clock),
+                }
+                if event.phase == StartupPhase::EngineStartup {
+                    return info(String::from(shape.active));
+                }
+                if shape.shown == Shown::Debug || shape.span == Span::Brief {
+                    return Throughput::Quiet;
+                }
+                let mut line = String::from(shape.active);
+                if bytes.is_some() && total != 0 {
+                    let _infallible = write!(line, " | {}", Bytes(total));
+                }
+                return info(line);
+            },
+            | StartupStatus::Progress => {
+                let Some(clock) = self
+                    .clocks
+                    .iter_mut()
+                    .find(|known| return known.phase == event.phase)
+                else {
+                    return Throughput::Quiet;
+                };
+                let done = bytes.unwrap_or(0);
+                clock.sample(infinitum_chat::ByteSize(done), now);
+                if now.saturating_duration_since(clock.written) < PROGRESS_INTERVAL {
+                    return Throughput::Quiet;
+                }
+                clock.written = now;
+                if bytes.is_none() || total == 0 {
+                    return Throughput::Quiet;
+                }
+                #[expect(
+                    clippy::as_conversions,
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "ninfer computes the ratio, rate and ETA in doubles and prints the rate's whole bytes"
+                )]
+                let line = {
+                    let mut line = format!(
+                        "  {} {} | {}/{}",
+                        shape.active,
+                        Percent(done as f64 / total as f64),
+                        Bytes(done),
+                        Bytes(total)
+                    );
+                    if clock.rate > 0.0_f64 {
+                        let _infallible = write!(line, " | {}/s", Bytes(clock.rate as u64));
+                        if done < total {
+                            let eta = total.saturating_sub(done) as f64 / clock.rate;
+                            let _infallible = write!(line, " | ETA {}", Duration(eta));
+                        }
+                    }
+                    line
+                };
+                return info(line);
+            },
+            | StartupStatus::Complete => {
+                if event.phase == StartupPhase::EngineStartup || shape.shown == Shown::Debug {
+                    return Throughput::Quiet;
+                }
+                let seconds = event.elapsed.as_secs_f64();
+                let mut line = String::from(shape.complete);
+                if let Some(done) = bytes {
+                    let reported = if done != 0 { done } else { total };
+                    let _infallible = write!(line, " | {}", Bytes(reported));
+                }
+                let _infallible = write!(line, " | {}", Duration(seconds));
+                let done = bytes.unwrap_or(0);
+                if shape.rate == Rate::Shown && seconds > 0.0_f64 && done != 0 {
+                    #[expect(
+                        clippy::as_conversions,
+                        clippy::cast_precision_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "ninfer divides in doubles and prints the rate's whole bytes"
+                    )]
+                    let rate = (done as f64 / seconds) as u64;
+                    let _infallible = write!(line, " | {}/s", Bytes(rate));
+                }
+                return info(line);
+            },
+            | StartupStatus::Failed => {
+                if self.failure == FailureLine::Written {
+                    return Throughput::Quiet;
+                }
+                self.failure = FailureLine::Written;
+                return Throughput::Active(Record {
+                    severity: Severity::Error,
+                    message: format!(
+                        "startup failed | {} | {}",
+                        shape.active,
+                        Duration(event.elapsed.as_secs_f64())
+                    ),
+                });
+            },
+        }
+    }
+}
+
+impl StartupObserver for StartupLog
+{
+    /// Write the report's line now, if it has one.
+    ///
+    /// # Specification
+    /// - requires: as [`StartupLog::line`].
+    /// - ensures: [`StartupLog::line`]'s line at the current instant was
+    ///   written.
+    /// - provides: the server's startup log.
+    /// - fails: never; a failed write is dropped as every log write is.
+    /// - panics: none.
+    #[inline]
+    fn observe(
+        &mut self,
+        event: StartupEvent,
+    )
+    {
+        if let Throughput::Active(record) = self.line(event, std::time::Instant::now()) {
+            emit(&record);
+        }
+    }
 }
 
 /// The line for an Engine that finished loading.
@@ -1597,6 +2027,209 @@ mod tests
             .message,
             "req#15 rejected during prepare | openai-chat non-stream | HTTP 400 | vision disabled | messages 1 | media 1 | tools 2",
             "media before tools, each when sent"
+        );
+    }
+
+    #[test]
+    fn startup_phases_log_as_ninfers()
+    {
+        use infinitum_chat::ByteSize;
+        use infinitum_chat::StartupAmount;
+        use infinitum_chat::StartupEvent;
+        use infinitum_chat::StartupPhase;
+        use infinitum_chat::StartupStatus;
+
+        const GIB: u64 = 1 << 30;
+        let start = std::time::Instant::now();
+        let at = |seconds: u64| return start + core::time::Duration::from_secs(seconds);
+        let bytes = |done: u64, total: u64| {
+            return StartupAmount::Bytes {
+                done: ByteSize(done),
+                total: ByteSize(total),
+            };
+        };
+        let event = |phase, status, amount, elapsed_ms: u64| {
+            return StartupEvent {
+                phase,
+                status,
+                amount,
+                elapsed: core::time::Duration::from_millis(elapsed_ms),
+            };
+        };
+        let untracked = StartupAmount::Untracked;
+        let mut log = super::StartupLog::default();
+        let mut line = |report: StartupEvent, seconds: u64| {
+            return match log.line(report, at(seconds)) {
+                | super::Throughput::Active(record) => Some((record.severity, record.message)),
+                | super::Throughput::Quiet => None,
+            };
+        };
+        let info = |text: &str| return Some((Severity::Info, String::from(text)));
+        assert_eq!(
+            line(
+                event(
+                    StartupPhase::EngineStartup,
+                    StartupStatus::Begin,
+                    untracked,
+                    0
+                ),
+                0
+            ),
+            info("starting engine"),
+            "the Engine phase opens the log"
+        );
+        assert_eq!(
+            line(
+                event(
+                    StartupPhase::CudaInitialize,
+                    StartupStatus::Complete,
+                    untracked,
+                    5
+                ),
+                0
+            ),
+            None,
+            "a debug phase writes nothing"
+        );
+        let weights = StartupPhase::WeightsMaterialize;
+        assert_eq!(
+            line(
+                event(weights, StartupStatus::Begin, bytes(0, 16 * GIB), 0),
+                0
+            ),
+            info("loading weights | 16.0 GiB"),
+            "a long phase announces its total"
+        );
+        assert_eq!(
+            line(
+                event(
+                    weights,
+                    StartupStatus::Progress,
+                    bytes(4 * GIB, 16 * GIB),
+                    0
+                ),
+                5
+            ),
+            None,
+            "progress within ten seconds of the beginning is sampled, not written"
+        );
+        assert_eq!(
+            line(
+                event(
+                    weights,
+                    StartupStatus::Progress,
+                    bytes(8 * GIB, 16 * GIB),
+                    0
+                ),
+                10
+            ),
+            info("  loading weights 50.0% | 8.00 GiB/16.0 GiB | 819.2 MiB/s | ETA 10.0s"),
+            "progress ten seconds on carries the smoothed rate and the ETA"
+        );
+        assert_eq!(
+            line(
+                event(
+                    weights,
+                    StartupStatus::Progress,
+                    bytes(12 * GIB, 16 * GIB),
+                    0
+                ),
+                15
+            ),
+            None,
+            "the next progress line waits ten seconds from the last"
+        );
+        assert_eq!(
+            line(
+                event(
+                    weights,
+                    StartupStatus::Complete,
+                    bytes(16 * GIB, 16 * GIB),
+                    20_000
+                ),
+                20
+            ),
+            info("weights ready | 16.0 GiB | 20.0s | 819.2 MiB/s"),
+            "the weights' completion carries size, duration and rate"
+        );
+        assert_eq!(
+            line(
+                event(
+                    StartupPhase::HostKvPin,
+                    StartupStatus::Complete,
+                    bytes(0, 36 * GIB),
+                    2_000
+                ),
+                22
+            ),
+            info("host KV pinned | 36.0 GiB | 2.0s"),
+            "a completion with no bytes done reports the total, without a rate"
+        );
+        assert_eq!(
+            line(
+                event(
+                    StartupPhase::CudaGraphPrepare,
+                    StartupStatus::Begin,
+                    untracked,
+                    0
+                ),
+                22
+            ),
+            None,
+            "a brief info phase does not announce its beginning"
+        );
+        assert_eq!(
+            line(
+                event(
+                    StartupPhase::CudaGraphPrepare,
+                    StartupStatus::Complete,
+                    untracked,
+                    1_500
+                ),
+                24
+            ),
+            info("CUDA graphs ready | 1.5s"),
+            "but reports its completion"
+        );
+        assert_eq!(
+            line(
+                event(
+                    StartupPhase::EngineStartup,
+                    StartupStatus::Complete,
+                    untracked,
+                    24_000
+                ),
+                24
+            ),
+            None,
+            "the Engine phase's duration goes to `engine ready`, not a line of its own"
+        );
+        let failed = event(
+            StartupPhase::HostStatePin,
+            StartupStatus::Failed,
+            untracked,
+            500,
+        );
+        assert_eq!(
+            line(failed, 25),
+            Some((
+                Severity::Error,
+                String::from("startup failed | pinning host state | 500 ms")
+            )),
+            "the first failure is an error line"
+        );
+        assert_eq!(
+            line(
+                event(
+                    StartupPhase::EngineStartup,
+                    StartupStatus::Failed,
+                    untracked,
+                    25_000
+                ),
+                25
+            ),
+            None,
+            "and the enclosing phases' failures add none"
         );
     }
 }

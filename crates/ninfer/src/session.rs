@@ -4,6 +4,12 @@
 //! round to an [`infinitum_round::Preview`]: infinitum makes the output
 //! decision, ninfer applies it and commits.
 
+use infinitum_chat::ByteSize;
+use infinitum_chat::StartupAmount;
+use infinitum_chat::StartupEvent;
+use infinitum_chat::StartupObserver;
+use infinitum_chat::StartupPhase;
+use infinitum_chat::StartupStatus;
 use infinitum_round::CountOverflow;
 use infinitum_round::Maybe;
 use infinitum_round::Preview;
@@ -510,6 +516,98 @@ pub fn review_round(
     };
 }
 
+/// The Rust side of an Engine's startup reports.
+#[repr(transparent)]
+pub struct StartupSink<'observer>(&'observer mut dyn StartupObserver);
+
+/// Forward one startup report to the observer.
+///
+/// # Specification
+/// - requires: reports arrive on the opening thread, in order.
+/// - ensures: a report whose phase and status the bridge names reaches the
+///   observer, its counts as bytes when the phase counts bytes; any other is
+///   dropped, as a phase ninfer adds later is one its own renderer shows only
+///   at debug level.
+/// - provides: the bridge's entry for ninfer's `StartupObserver`.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 on a byte-counted phase, an uncounted one, and an unnamed
+///   phase.
+/// - witness: `tests::startup_reports_cross_the_bridge`
+// The `cxx` border: the counts and nanoseconds are wrapped on the first line
+// past it.
+pub fn startup_event(
+    sink: &mut StartupSink<'_>,
+    record: &ffi::StartupRecord,
+)
+{
+    let Maybe::Present(event) = startup_of(record)
+    else {
+        return;
+    };
+    sink.0.observe(event);
+}
+
+/// Why a startup record has no event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unnamed
+{
+    /// Its phase or status is one the bridge does not name.
+    Unrecognized,
+}
+
+/// The event a startup record carries.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: as [`startup_event`] forwards it.
+/// - provides: [`startup_event`]'s translation.
+/// - fails: never.
+/// - panics: none.
+fn startup_of(record: &ffi::StartupRecord) -> Maybe<StartupEvent, Unnamed>
+{
+    let phase = match record.phase {
+        | ffi::StartupPhase::EngineStartup => StartupPhase::EngineStartup,
+        | ffi::StartupPhase::CudaInitialize => StartupPhase::CudaInitialize,
+        | ffi::StartupPhase::ArtifactInspect => StartupPhase::ArtifactInspect,
+        | ffi::StartupPhase::TargetPlan => StartupPhase::TargetPlan,
+        | ffi::StartupPhase::WeightsMaterialize => StartupPhase::WeightsMaterialize,
+        | ffi::StartupPhase::WeightsStagingPin => StartupPhase::WeightsStagingPin,
+        | ffi::StartupPhase::TargetFinalize => StartupPhase::TargetFinalize,
+        | ffi::StartupPhase::FrontendInitialize => StartupPhase::FrontendInitialize,
+        | ffi::StartupPhase::ProgramInitialize => StartupPhase::ProgramInitialize,
+        | ffi::StartupPhase::HostStatePin => StartupPhase::HostStatePin,
+        | ffi::StartupPhase::HostKvPin => StartupPhase::HostKvPin,
+        | ffi::StartupPhase::CudaGraphPrepare => StartupPhase::CudaGraphPrepare,
+        | ffi::StartupPhase::EngineFinalize => StartupPhase::EngineFinalize,
+        | _ => return Maybe::Absent(Unnamed::Unrecognized),
+    };
+    let status = match record.status {
+        | ffi::StartupStatus::Begin => StartupStatus::Begin,
+        | ffi::StartupStatus::Progress => StartupStatus::Progress,
+        | ffi::StartupStatus::Complete => StartupStatus::Complete,
+        | ffi::StartupStatus::Failed => StartupStatus::Failed,
+        | _ => return Maybe::Absent(Unnamed::Unrecognized),
+    };
+    let amount = if record.bytes {
+        StartupAmount::Bytes {
+            done: ByteSize(record.current),
+            total: ByteSize(record.total),
+        }
+    }
+    else {
+        StartupAmount::Untracked
+    };
+    return Maybe::Present(StartupEvent {
+        phase,
+        status,
+        amount,
+        elapsed: core::time::Duration::from_nanos(record.elapsed_ns),
+    });
+}
+
 /// An open ninfer Engine, running the DFlash2 round a plan chose.
 #[repr(transparent)]
 pub struct Session
@@ -536,16 +634,18 @@ impl core::fmt::Debug for Session
 
 impl Session
 {
-    /// Open an Engine for `options` running `plan`.
+    /// Open an Engine for `options` running `plan`, reporting its startup
+    /// phases to `observer`.
     ///
     /// # Specification
     /// - requires: nothing.
     /// - ensures: on success the Engine runs DFlash2 at the plan's width with
     ///   the optimized proposal head and an explicit KV capacity equal to the
-    ///   context ceiling.
+    ///   context ceiling; `observer` received each phase's reports while the
+    ///   Engine opened, and none after this returns.
     /// - provides: the only way to reach the Engine.
     /// - fails: when the artifact path is not Unicode, or ninfer throws while
-    ///   opening.
+    ///   opening, after `observer` received the failing phase's report.
     /// - panics: none.
     ///
     /// # Errors
@@ -558,6 +658,7 @@ impl Session
     pub fn open(
         options: &EngineOptions,
         plan: DFlash2Plan,
+        observer: &mut dyn StartupObserver,
     ) -> Result<Self, EngineFailure>
     {
         let artifact = options
@@ -612,7 +713,8 @@ impl Session
             chat_template,
         };
         let mut outcome = pending();
-        let engine = ffi::open_session(&config, &mut outcome);
+        let mut sink = StartupSink(observer);
+        let engine = ffi::open_session(&config, &mut sink, &mut outcome);
         check(Operation::Open, outcome)?;
         return Ok(Self { engine });
     }
@@ -778,5 +880,74 @@ impl Session
         ffi::detokenize(self.engine(), &raw, &mut bytes, &mut outcome);
         check(Operation::Detokenize, outcome)?;
         return Ok(RenderedBytes::from(bytes));
+    }
+}
+
+/// Tests for the startup report translation.
+#[cfg(test)]
+mod tests
+{
+    use infinitum_chat::ByteSize;
+    use infinitum_chat::StartupAmount;
+    use infinitum_chat::StartupEvent;
+    use infinitum_chat::StartupPhase;
+    use infinitum_chat::StartupStatus;
+    use infinitum_round::Maybe;
+
+    use super::Unnamed;
+    use super::startup_of;
+    use crate::bridge::ffi;
+
+    #[test]
+    fn startup_reports_cross_the_bridge()
+    {
+        let weights = ffi::StartupRecord {
+            phase: ffi::StartupPhase::WeightsMaterialize,
+            status: ffi::StartupStatus::Complete,
+            bytes: true,
+            current: 7,
+            total: 9,
+            elapsed_ns: 1_500_000_000,
+        };
+        assert_eq!(
+            startup_of(&weights),
+            Maybe::Present(StartupEvent {
+                phase: StartupPhase::WeightsMaterialize,
+                status: StartupStatus::Complete,
+                amount: StartupAmount::Bytes {
+                    done: ByteSize(7),
+                    total: ByteSize(9),
+                },
+                elapsed: core::time::Duration::from_millis(1500),
+            }),
+            "a byte-counted phase carries its counts and duration"
+        );
+        let graphs = ffi::StartupRecord {
+            phase: ffi::StartupPhase::CudaGraphPrepare,
+            status: ffi::StartupStatus::Begin,
+            bytes: false,
+            current: 3,
+            total: 4,
+            elapsed_ns: 0,
+        };
+        assert!(
+            matches!(
+                startup_of(&graphs),
+                Maybe::Present(StartupEvent {
+                    amount: StartupAmount::Untracked,
+                    ..
+                })
+            ),
+            "an uncounted phase's counts are not read"
+        );
+        let later = ffi::StartupRecord {
+            phase: ffi::StartupPhase { repr: 200 },
+            ..graphs
+        };
+        assert_eq!(
+            startup_of(&later),
+            Maybe::Absent(Unnamed::Unrecognized),
+            "a phase the bridge does not name is dropped"
+        );
     }
 }
