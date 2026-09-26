@@ -1,5 +1,5 @@
 //! How an Engine is opened: the artifact, the device, the context ceiling,
-//! and CUDA graph capture.
+//! CUDA graph capture, and the chat template.
 
 /// The logical ceiling of one request in tokens, prompt and generation
 /// together. The Engine also sizes its KV cache from it, so a small ceiling
@@ -160,6 +160,16 @@ impl core::error::Error for UnknownCudaGraph
 {
 }
 
+/// Which chat template renders a chat prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatTemplate
+{
+    /// The template the artifact embeds.
+    Artifact,
+    /// The Jinja template in this file.
+    File(std::path::PathBuf),
+}
+
 /// Everything an Engine is opened with except the round, which the plan
 /// supplies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,11 +183,13 @@ pub struct EngineOptions
     context: ContextLimit,
     /// CUDA graph capture.
     cuda_graph: CudaGraph,
+    /// The chat template.
+    chat_template: ChatTemplate,
 }
 
 impl EngineOptions
 {
-    /// Gather the options.
+    /// Gather the options, with the artifact's own chat template.
     ///
     /// # Specification
     /// trivial.
@@ -195,7 +207,36 @@ impl EngineOptions
             device,
             context,
             cuda_graph,
+            chat_template: ChatTemplate::Artifact,
         };
+    }
+
+    /// The same options with `template` rendering chat prompts.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub fn with_chat_template(
+        self,
+        template: ChatTemplate,
+    ) -> Self
+    {
+        return Self {
+            chat_template: template,
+            ..self
+        };
+    }
+
+    /// The chat template.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn chat_template(&self) -> &ChatTemplate
+    {
+        return &self.chat_template;
     }
 
     /// The artifact.

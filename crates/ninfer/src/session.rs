@@ -15,6 +15,7 @@ use infinitum_round::TokenCount;
 use infinitum_round::TokenId;
 
 use crate::bridge::ffi;
+use crate::options::ChatTemplate;
 use crate::options::CudaGraph;
 use crate::options::EngineOptions;
 use crate::plan::DFlash2Plan;
@@ -95,6 +96,8 @@ pub enum EngineFailure
     /// The artifact path is not Unicode, which the bridge's string cannot
     /// carry.
     ArtifactPath(std::path::PathBuf),
+    /// The chat template path is not Unicode.
+    TemplatePath(std::path::PathBuf),
     /// ninfer threw.
     Thrown
     {
@@ -127,6 +130,13 @@ impl core::fmt::Display for EngineFailure
             | Self::ArtifactPath(ref path) => {
                 write!(f, "the artifact path {} is not Unicode", path.display())
             },
+            | Self::TemplatePath(ref path) => {
+                write!(
+                    f,
+                    "the chat template path {} is not Unicode",
+                    path.display()
+                )
+            },
             | Self::Thrown {
                 operation,
                 kind,
@@ -146,10 +156,11 @@ impl core::error::Error for EngineFailure
 ///
 /// # Specification
 /// trivial.
-fn pending() -> ffi::Outcome
+pub fn pending() -> ffi::Outcome
 {
     return ffi::Outcome {
         status: ffi::Status::Unknown,
+        refusal: ffi::Refusal::None,
         message: String::new(),
     };
 }
@@ -166,14 +177,14 @@ fn pending() -> ffi::Outcome
 ///
 /// # Errors
 /// - [`EngineFailure::Thrown`]: ninfer threw.
-fn check(
+pub fn check(
     operation: Operation,
     outcome: ffi::Outcome,
 ) -> Result<(), EngineFailure>
 {
     let kind = match outcome.status {
         | ffi::Status::Completed => return Ok(()),
-        | ffi::Status::InvalidArgument => ThrownKind::InvalidArgument,
+        | ffi::Status::InvalidArgument | ffi::Status::Refused => ThrownKind::InvalidArgument,
         | ffi::Status::Runtime => ThrownKind::Runtime,
         | _ => ThrownKind::Unknown,
     };
@@ -408,6 +419,31 @@ pub struct ReviewSink
     failure: Maybe<CountOverflow, Reviewing>,
 }
 
+impl ReviewSink
+{
+    /// A sink whose preview admits at most `budget` tokens.
+    ///
+    /// # Specification
+    /// trivial.
+    pub const fn new(budget: TokenCount) -> Self
+    {
+        return Self {
+            preview: Preview::new(budget),
+            scratch: Vec::new(),
+            failure: Maybe::Absent(Reviewing::Clean),
+        };
+    }
+
+    /// The first failure a review met, or why there is none.
+    ///
+    /// # Specification
+    /// trivial.
+    pub const fn failure(&self) -> Maybe<CountOverflow, Reviewing>
+    {
+        return self.failure;
+    }
+}
+
 /// Why a sink holds no failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reviewing
@@ -519,6 +555,15 @@ impl Session
             .artifact()
             .to_str()
             .ok_or_else(|| return EngineFailure::ArtifactPath(options.artifact().to_path_buf()))?;
+        let chat_template = match *options.chat_template() {
+            | ChatTemplate::Artifact => String::new(),
+            | ChatTemplate::File(ref path) => {
+                let text = path
+                    .to_str()
+                    .ok_or_else(|| return EngineFailure::TemplatePath(path.clone()))?;
+                String::from(text)
+            },
+        };
         let config = ffi::EngineConfig {
             artifact: String::from(artifact),
             device: i32::from(options.device()),
@@ -528,6 +573,7 @@ impl Session
                 | CudaGraph::Off => ffi::CudaGraph::Off,
                 | CudaGraph::On => ffi::CudaGraph::On,
             },
+            chat_template,
         };
         let mut outcome = pending();
         let engine = ffi::open_session(&config, &mut outcome);
@@ -545,7 +591,7 @@ impl Session
     /// - fails: never.
     /// - panics: none; a null Engine is unreachable, and reading one would be
     ///   reported by `cxx` as an abort rather than a panic.
-    fn engine(&self) -> &ffi::Session
+    pub(crate) fn engine(&self) -> &ffi::Session
     {
         let Some(engine) = self.engine.as_ref()
         else {

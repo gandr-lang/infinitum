@@ -6,9 +6,14 @@
 //! one prompt through infinitum's DFlash2 round on ninfer's Engine and prints
 //! the prompt's ids, the greedy continuation's ids, its text, and the round
 //! tallies: the reference an implementation of the same model is compared
-//! against.
+//! against. `infinitum serve` serves OpenAI-compatible chat completions over
+//! HTTP from the same Engine and round.
+
+#[cfg(feature = "ninfer")]
+extern crate alloc;
 
 mod generate;
+mod serve;
 
 use std::io::Write as _;
 
@@ -31,6 +36,9 @@ enum Command
     /// tokenize, generate greedily, and print the ids, the text, and the round
     /// tallies.
     Generate(generate::Request),
+    /// Serve OpenAI-compatible chat completions over HTTP from ninfer's
+    /// Engine, with infinitum's DFlash2 round reviewing every round.
+    Serve(serve::Server),
 }
 
 /// A failure of an invocation.
@@ -39,6 +47,8 @@ enum DriverFailure
 {
     /// The request failed.
     Request(generate::RequestFailure),
+    /// The server failed.
+    Serve(serve::ServeFailure),
     /// Writing the help or flushing the output failed.
     Output(std::io::Error),
 }
@@ -52,6 +62,18 @@ impl From<generate::RequestFailure> for DriverFailure
     fn from(failure: generate::RequestFailure) -> Self
     {
         return Self::Request(failure);
+    }
+}
+
+impl From<serve::ServeFailure> for DriverFailure
+{
+    /// Wrap a server failure.
+    ///
+    /// # Specification
+    /// trivial.
+    fn from(failure: serve::ServeFailure) -> Self
+    {
+        return Self::Serve(failure);
     }
 }
 
@@ -80,6 +102,7 @@ impl core::fmt::Display for DriverFailure
     {
         return match *self {
             | Self::Request(ref failure) => core::fmt::Display::fmt(failure, f),
+            | Self::Serve(ref failure) => core::fmt::Display::fmt(failure, f),
             | Self::Output(ref failure) => write!(f, "cannot write the output: {failure}"),
         };
     }
@@ -144,20 +167,24 @@ where
 /// # Specification
 /// - requires: `out` accepts bytes.
 /// - ensures: with no command, `out` holds the long help; with `generate`, it
-///   holds the request's rendering; either way `out` is flushed on success.
+///   holds the request's rendering; with `serve`, it holds the ready line and
+///   the call returns only when the server stops; `out` is flushed on success.
 /// - provides: the driver's behavior, apart from the process boundary.
-/// - fails: with the request's failure, or with the writer's error.
+/// - fails: with the request's or the server's failure, or with the writer's
+///   error.
 /// - panics: none.
 ///
 /// # Errors
 /// - [`DriverFailure::Request`]: the request failed.
+/// - [`DriverFailure::Serve`]: the server failed.
 /// - [`DriverFailure::Output`]: writing or flushing `out` failed.
 ///
 /// # Adequacy
-/// - hypothesis: L3 over the two command shapes — none renders help, and
-///   `generate` reaches the request, observed by its planning refusal.
+/// - hypothesis: L3 over the three command shapes — none renders help, and
+///   `generate` and `serve` each reach their planning, observed by its refusal.
 /// - witness: `tests::a_bare_invocation_renders_help`
 /// - witness: `tests::generate_reaches_the_request`
+/// - witness: `tests::serve_plans_before_opening`
 fn run<Writer>(
     cli: Cli,
     out: &mut Writer,
@@ -168,6 +195,7 @@ where
     match cli.command {
         | None => render_long_help(out)?,
         | Some(Command::Generate(request)) => generate::run(&request, out)?,
+        | Some(Command::Serve(server)) => serve::run(&server, out)?,
     }
     out.flush()?;
     return Ok(());
@@ -216,6 +244,7 @@ mod tests
     use super::render_long_help;
     use super::run;
     use crate::generate::RequestFailure;
+    use crate::serve::ServeFailure;
 
     /// The command renders under the name the binary installs as.
     #[test]
@@ -264,6 +293,10 @@ mod tests
             rendered.contains("generate"),
             "the help lists the generate command: {rendered}"
         );
+        assert!(
+            rendered.contains("serve"),
+            "the help lists the serve command: {rendered}"
+        );
     }
 
     /// A bare invocation writes the long help.
@@ -301,6 +334,36 @@ mod tests
                     if matches!(refusal.reason(), RefusalReason::UnsupportedWidth(_))
             ),
             "the request's planning refusal is reported: {failed:?}"
+        );
+    }
+
+    /// `serve` plans the round before anything opens, observed through its
+    /// planning refusal.
+    #[test]
+    fn serve_plans_before_opening()
+    {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "infinitum",
+            "serve",
+            "--artifact",
+            "model.ninfer",
+            "--draft-width",
+            "16",
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let failed = run(cli, &mut out);
+        assert!(
+            matches!(
+                failed,
+                Err(DriverFailure::Serve(ServeFailure::Plan(ref refusal)))
+                    if matches!(refusal.reason(), RefusalReason::UnsupportedWidth(_))
+            ),
+            "the server's planning refusal is reported: {failed:?}"
+        );
+        assert!(
+            out.is_empty(),
+            "nothing is written before the server is ready"
         );
     }
 

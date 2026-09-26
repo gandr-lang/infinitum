@@ -15,6 +15,11 @@
 namespace infinitum::ninfer {
 
 // Shared with Rust; the bridge's generated header defines them.
+struct CancelFlag;
+struct ChatPrompt;
+struct ChatRecord;
+struct ChatSettings;
+struct ChatSink;
 struct EngineConfig;
 struct GenerationRecord;
 struct Outcome;
@@ -39,11 +44,13 @@ public:
     Session& operator=(Session&&)      = delete;
     ~Session()                         = default;
 
-    ::ninfer::Engine engine;
+    // Mutable because every Engine operation is internally synchronized: the chat path submits
+    // requests from many threads through a shared Session, as ninfer's own server does.
+    mutable ::ninfer::Engine engine;
 };
 
-/// Open an Engine for `config`: DFlash2 at `config.draft_width`, the optimized proposal head, and
-/// an explicit KV capacity equal to `config.max_context`.
+/// Open an Engine for `config`: DFlash2 at `config.draft_width`, the optimized proposal head, an
+/// explicit KV capacity equal to `config.max_context`, and `config.chat_template` when non-empty.
 ///
 /// # Specification
 /// - requires: nothing.
@@ -95,5 +102,34 @@ void generate(Session& session, rust::Slice<const std::int32_t> prompt, std::uin
 /// - panics: none.
 void detokenize(const Session& session, rust::Slice<const std::int32_t> ids,
                 rust::Vec<std::uint8_t>& bytes, Outcome& outcome) noexcept;
+
+/// Read the model name the artifact records.
+///
+/// # Specification
+/// - requires: `session` is open.
+/// - ensures: on success `name` holds the Engine's `load_summary().model_name` and
+///   `outcome.status` is `Completed`; on failure `outcome` holds the exception.
+/// - provides: the default public model id.
+/// - fails: when ninfer throws; reported through `outcome`, never thrown.
+/// - panics: none.
+void model_name(const Session& session, rust::String& name, Outcome& outcome) noexcept;
+
+/// Run one chat request: render and prepare `prompt`, submit it with `settings`, and wait for
+/// its result, publishing to `sink` when streaming and reviewing every round through `review`.
+///
+/// # Specification
+/// - requires: `session` is open; `sink`, `cancel` and `review` outlive the call.
+/// - ensures: on success `record` holds ninfer's content, reasoning, tool calls, finish reason,
+///   prompt accounting, generated ids, reasoning count, phase times and speculative tallies, and
+///   `outcome.status` is `Completed`; a refusal sets `Refused` and its class. `sink` is reached
+///   only on the calling thread and only before return; `cancel` only through cancellation views
+///   passed to calls that end before return; `review` only through a controller detached before
+///   return.
+/// - provides: infinitum's serving path on ninfer.
+/// - fails: when ninfer refuses or throws; reported through `outcome`, never thrown.
+/// - panics: none.
+void run_chat(const Session& session, const ChatPrompt& prompt, const ChatSettings& settings,
+              ChatSink& sink, const CancelFlag& cancel, ReviewSink& review, ChatRecord& record,
+              Outcome& outcome) noexcept;
 
 } // namespace infinitum::ninfer

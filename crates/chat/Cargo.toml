@@ -1,0 +1,20 @@
+# A chat request and its outcome, as infinitum hands them to a serving
+# backend: the protocol-neutral conversation, the generation settings, the
+# events a streaming consumer receives, and the backend contract. No protocol
+# and no backend is linked here.
+[package]
+name = "infinitum-chat"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "The protocol-neutral chat request and the serving-backend contract of the infinitum engine"
+readme = "README.md"
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+infinitum-round.workspace = true
+
+[lints]
+workspace = true
