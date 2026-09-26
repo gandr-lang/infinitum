@@ -92,6 +92,33 @@ pub enum Access
     Key(ApiKey),
 }
 
+impl Access
+{
+    /// The access a configured key grants.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: [`Access::Open`] for an empty key, as ninfer's server treats
+    ///   an empty `--api-key` as no authentication; [`Access::Key`] otherwise,
+    ///   so no empty credential is ever accepted.
+    /// - provides: the lowering of the `--api-key` flag.
+    /// - fails: never.
+    /// - panics: none.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at the empty boundary.
+    /// - witness: `tests::an_empty_key_leaves_the_api_open`
+    #[inline]
+    #[must_use]
+    pub fn of(key: ApiKey) -> Self
+    {
+        if key.0.is_empty() {
+            return Self::Open;
+        }
+        return Self::Key(key);
+    }
+}
+
 /// How the server answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServeConfig
@@ -1036,6 +1063,21 @@ mod tests
             bearer_matches(&HeaderValue::from_static("Basic k"), &key),
             Verdict::Refused,
             "another scheme is refused"
+        );
+    }
+
+    #[test]
+    fn an_empty_key_leaves_the_api_open()
+    {
+        assert_eq!(
+            Access::of(ApiKey(String::new())),
+            Access::Open,
+            "an empty key means no authentication, as ninfer's, never an empty credential"
+        );
+        assert_eq!(
+            Access::of(ApiKey(String::from("k"))),
+            Access::Key(ApiKey(String::from("k"))),
+            "a key gates the API"
         );
     }
 

@@ -49,8 +49,8 @@ pub struct Server
     /// The port to listen on.
     #[arg(long, value_name = "PORT", default_value = "8080")]
     port: u16,
-    /// The key clients present as a bearer token or `x-api-key`; absent,
-    /// the API is open.
+    /// The key clients present as a bearer token or `x-api-key`; absent or
+    /// empty, the API is open, as ninfer's is.
     #[arg(long, value_name = "KEY")]
     api_key: Option<String>,
     /// The model id clients name; absent, the artifact's model name.
@@ -249,7 +249,7 @@ where
         .api_key
         .clone()
         .map_or(infinitum_serve::Access::Open, |key| {
-            return infinitum_serve::Access::Key(infinitum_serve::ApiKey(key));
+            return infinitum_serve::Access::of(infinitum_serve::ApiKey(key));
         });
     let config = infinitum_serve::ServeConfig {
         model: infinitum_serve::ModelId(model),
