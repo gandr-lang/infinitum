@@ -20,6 +20,7 @@ use crate::graph::RoundBuilder;
 use crate::graph::RoundGraph;
 
 /// A drafter's output: the fragment holding the proposal.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Proposal
 {
@@ -28,6 +29,7 @@ pub struct Proposal
 }
 
 /// A verifier's output: the fragment holding the target's scores.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verification
 {
@@ -37,6 +39,7 @@ pub struct Verification
 
 /// An acceptor's output: the fragment holding the licensed tokens and the
 /// accepted length.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Licensed
 {
@@ -175,6 +178,7 @@ where
 }
 
 /// The DFlash2 drafter at one draft width.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DFlash2Drafter
 {

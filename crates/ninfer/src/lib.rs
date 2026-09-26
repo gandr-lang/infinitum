@@ -12,6 +12,7 @@ mod options;
 mod plan;
 #[cfg(feature = "engine")]
 mod session;
+mod text;
 
 pub use options::ContextLimit;
 pub use options::CudaGraph;
@@ -36,3 +37,5 @@ pub use session::Session;
 pub use session::Speculation;
 #[cfg(feature = "engine")]
 pub use session::ThrownKind;
+pub use text::RawText;
+pub use text::RenderedBytes;

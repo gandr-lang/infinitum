@@ -24,6 +24,7 @@ const MAX_WIDTH: u32 = 15;
 pub struct Ninfer;
 
 /// A graph ninfer runs: its fused DFlash2 round at one width.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DFlash2Plan
 {

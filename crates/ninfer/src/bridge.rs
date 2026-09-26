@@ -11,6 +11,21 @@
 )]
 
 /// The declarations `cxx` checks on both sides.
+///
+/// # Safety
+/// The `unsafe extern "C++"` block below asserts that every declared C++
+/// function is safe to call from safe Rust with any arguments its Rust
+/// signature admits.
+/// - unsafe invariants: each declaration matches its definition in
+///   `cxx/adapter.h` and `cxx/adapter.cpp`, which `cxx` checks at compile time
+///   through the generated header; every adapter function is `noexcept` and
+///   catches every exception from ninfer at its call site, so no exception
+///   crosses into Rust (an escaping one would terminate the process, never
+///   unwind); `generate` touches the `ReviewSink` only through a controller
+///   whose pointer to it is cleared under a mutex before `generate` returns, so
+///   the Engine never reaches the sink after its borrow ends; `Session` is used
+///   only through the `UniquePtr` `open_session` returns, and only when that
+///   pointer is non-null.
 #[cxx::bridge(namespace = "infinitum::ninfer")]
 pub mod ffi
 {
@@ -148,6 +163,8 @@ pub mod ffi
         ) -> ReviewAnswer;
     }
 
+    // SAFETY: the declarations below are sound to call from safe Rust under
+    // the unsafe invariants stated in this module's `# Safety` section.
     unsafe extern "C++" {
         include!("infinitum-ninfer/cxx/adapter.h");
 

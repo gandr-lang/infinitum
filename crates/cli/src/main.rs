@@ -13,6 +13,7 @@ mod generate;
 use std::io::Write as _;
 
 /// The infinitum command line.
+#[repr(transparent)]
 #[derive(Debug, clap::Parser)]
 #[command(name = "infinitum", version, about)]
 struct Cli

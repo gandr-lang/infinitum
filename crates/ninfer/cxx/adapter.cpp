@@ -17,12 +17,25 @@
 namespace infinitum::ninfer {
 namespace {
 
+/// Record success.
+///
+/// # Specification
+/// trivial.
 void succeed(Outcome& outcome) noexcept {
     outcome.status = Status::Completed;
     outcome.message = rust::String();
 }
 
-// Classifies the exception in flight. Called only from a catch-all handler.
+/// Classify the exception in flight into `outcome`.
+///
+/// # Specification
+/// - requires: called only from inside a catch handler, so an exception is in flight.
+/// - ensures: `outcome.status` is `InvalidArgument` for `std::invalid_argument`, `Runtime` for any
+///   other `std::exception`, and `Unknown` otherwise; `outcome.message` carries `what()` when
+///   there is one.
+/// - provides: the one mapping from ninfer's exceptions to the bridge's statuses.
+/// - fails: never.
+/// - panics: none.
 void fail(Outcome& outcome) noexcept {
     try {
         throw;
@@ -38,6 +51,15 @@ void fail(Outcome& outcome) noexcept {
     }
 }
 
+/// Map ninfer's finish reason onto the bridge's.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: each known reason maps to its namesake; a value outside the enumeration maps to
+///   `Unrecognized`.
+/// - provides: the record's finish field.
+/// - fails: never.
+/// - panics: none.
 Finish to_finish(::ninfer::FinishReason reason) noexcept {
     switch (reason) {
     case ::ninfer::FinishReason::None: return Finish::Unfinished;
@@ -50,13 +72,22 @@ Finish to_finish(::ninfer::FinishReason reason) noexcept {
     return Finish::Unrecognized;
 }
 
-// Forwards each round to the Rust sink until detached. The Engine may hold the controller past
-// the request's end, so the sink is reached only through a pointer the generating call clears
-// before it returns.
+/// Forwards each round to the Rust sink until detached. The Engine may hold the controller past
+/// the request's end, so the sink is reached only through a pointer the generating call clears
+/// before it returns.
 class Controller final : public ::ninfer::RoundController {
 public:
     explicit Controller(ReviewSink& sink) noexcept : sink_(&sink) {}
 
+    /// Review one round through the Rust sink.
+    ///
+    /// # Specification
+    /// - requires: nothing; ninfer calls it on its worker thread.
+    /// - ensures: while attached, the verdict is the sink's answer (a limit carries its length);
+    ///   once detached, the verdict is to continue and the sink is not reached.
+    /// - provides: the host decision each round asks for.
+    /// - fails: never; the Rust side holds any failure in the sink.
+    /// - panics: none.
     ::ninfer::RoundVerdict review(const ::ninfer::RoundOffer& offer) noexcept override {
         const std::lock_guard lock(mutex_);
         if (sink_ == nullptr) { return {}; }
@@ -68,6 +99,15 @@ public:
         return {};
     }
 
+    /// Stop reaching the sink.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: every later `review` returns without touching the sink, and a `review` in
+    ///   progress finishes before this returns.
+    /// - provides: the lifetime cut `generate` relies on.
+    /// - fails: never.
+    /// - panics: none.
     void detach() noexcept {
         const std::lock_guard lock(mutex_);
         sink_ = nullptr;
@@ -78,7 +118,7 @@ private:
     ReviewSink* sink_;
 };
 
-// Detaches the controller on every exit from generate.
+/// Detaches the controller on every exit from generate.
 class Detach {
 public:
     explicit Detach(Controller& controller) noexcept : controller_(controller) {}
@@ -92,7 +132,15 @@ private:
     Controller& controller_;
 };
 
-// The greedy request of ninfer's own C facade: argmax, no penalties, the model's stop tokens.
+/// The greedy request of ninfer's own C facade: argmax, no penalties, the model's stop tokens.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: the request asks for at most `budget` tokens with temperature 0, top-k off, top-p 1,
+///   min-p 0, no penalties and seed 0.
+/// - provides: the options every generation uses.
+/// - fails: never.
+/// - panics: none.
 ::ninfer::RequestOptions greedy(std::uint32_t budget) {
     ::ninfer::RequestOptions request;
     request.execution.requested_output_tokens    = budget;
@@ -106,6 +154,14 @@ private:
     return request;
 }
 
+/// Convert seconds to whole nanoseconds.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: zero for a non-positive or NaN input; otherwise the truncated count.
+/// - provides: the record's wall-time field.
+/// - fails: never.
+/// - panics: none.
 std::uint64_t nanoseconds(double seconds) noexcept {
     if (!(seconds > 0.0)) { return 0; }
     return static_cast<std::uint64_t>(seconds * 1e9);

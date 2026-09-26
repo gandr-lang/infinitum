@@ -69,6 +69,7 @@ impl Fragment
 
 /// A well-formed round: execute fragments, then commit fragments, each
 /// commit fragment reading an acceptance.
+#[repr(transparent)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RoundGraph
 {

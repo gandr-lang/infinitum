@@ -18,6 +18,8 @@ use crate::bridge::ffi;
 use crate::options::CudaGraph;
 use crate::options::EngineOptions;
 use crate::plan::DFlash2Plan;
+use crate::text::RawText;
+use crate::text::RenderedBytes;
 
 /// The Engine operation a failure came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,6 +426,10 @@ pub enum Reviewing
 /// - provides: the host decision ninfer's Engine asks for each round.
 /// - fails: never across the boundary; a failure is held in the sink.
 /// - panics: none.
+// The `cxx` border: the bridge declares this signature and generates its C++
+// caller, and a `cxx` shared signature carries only primitives, slices of
+// them, and bridge-declared types, so no nominal token type fits here. The ids
+// are wrapped as `TokenId` on the first line past the border.
 pub fn review_round(
     sink: &mut ReviewSink,
     licensed: &[i32],
@@ -460,6 +466,7 @@ pub fn review_round(
 }
 
 /// An open ninfer Engine, running the DFlash2 round a plan chose.
+#[repr(transparent)]
 pub struct Session
 {
     /// The adapter's Engine.
@@ -565,12 +572,12 @@ impl Session
     #[inline]
     pub fn tokenize(
         &self,
-        text: &str,
+        text: RawText<'_>,
     ) -> Result<Vec<TokenId>, EngineFailure>
     {
         let mut ids = Vec::new();
         let mut outcome = pending();
-        ffi::tokenize(self.engine(), text, &mut ids, &mut outcome);
+        ffi::tokenize(self.engine(), text.as_ref(), &mut ids, &mut outcome);
         check(Operation::Tokenize, outcome)?;
         return Ok(ids.into_iter().map(TokenId::from).collect());
     }
@@ -678,13 +685,13 @@ impl Session
     pub fn detokenize(
         &self,
         ids: &[TokenId],
-    ) -> Result<Vec<u8>, EngineFailure>
+    ) -> Result<RenderedBytes, EngineFailure>
     {
         let raw: Vec<i32> = ids.iter().copied().map(i32::from).collect();
         let mut bytes = Vec::new();
         let mut outcome = pending();
         ffi::detokenize(self.engine(), &raw, &mut bytes, &mut outcome);
         check(Operation::Detokenize, outcome)?;
-        return Ok(bytes);
+        return Ok(RenderedBytes::from(bytes));
     }
 }

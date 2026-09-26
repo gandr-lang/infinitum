@@ -18,6 +18,8 @@ use infinitum_ninfer::CudaGraph;
 use infinitum_ninfer::DFlash2Plan;
 use infinitum_ninfer::DeviceOrdinal;
 use infinitum_ninfer::Ninfer;
+#[cfg(any(feature = "ninfer", test))]
+use infinitum_ninfer::RenderedBytes;
 use infinitum_round::Backend as _;
 use infinitum_round::BuildFailure;
 use infinitum_round::DraftWidth;
@@ -76,14 +78,6 @@ impl core::str::FromStr for Prompt
         return Ok(Self(String::from(text)));
     }
 }
-
-/// Bytes rendered from token ids: exactly what the ids encode, not UTF-8
-/// validated, since a generation budget can end inside a multi-byte
-/// character.
-#[cfg(any(feature = "ninfer", test))]
-#[repr(transparent)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RenderedBytes(Vec<u8>);
 
 /// Run one prompt through infinitum's DFlash2 round on ninfer: plan, open,
 /// tokenize, generate greedily, and print the ids, the text, and the round
@@ -317,9 +311,9 @@ where
         request.cuda_graph,
     );
     let mut session = infinitum_ninfer::Session::open(&options, plan)?;
-    let prompt = session.tokenize(&request.prompt.0)?;
+    let prompt = session.tokenize(infinitum_ninfer::RawText::from(request.prompt.0.as_str()))?;
     let generation = session.generate(&prompt, request.max_new_tokens.0)?;
-    let text = RenderedBytes(session.detokenize(generation.generated())?);
+    let text = session.detokenize(generation.generated())?;
     drop(session);
     let completion = Completion {
         prompt,
@@ -441,7 +435,7 @@ where
     render_ids(IdsLabel::Prompt, &completion.prompt, out)?;
     render_ids(IdsLabel::Generated, &completion.generated, out)?;
     writeln!(out, "generated text:")?;
-    out.write_all(&completion.text.0)?;
+    out.write_all(completion.text.as_ref())?;
     writeln!(out)?;
     return Ok(());
 }
@@ -468,7 +462,7 @@ mod tests
         let completion = Completion {
             prompt: [9707_i32, 11_i32].map(TokenId::from).to_vec(),
             generated: [1879_i32, 0_i32, 13_i32].map(TokenId::from).to_vec(),
-            text: RenderedBytes(b"world\xe4".to_vec()),
+            text: RenderedBytes::from(b"world\xe4".to_vec()),
         };
         render(&completion, &mut out).unwrap();
         assert_eq!(
@@ -485,7 +479,7 @@ mod tests
         let completion = Completion {
             prompt: vec![TokenId::from(1_i32)],
             generated: Vec::new(),
-            text: RenderedBytes(Vec::new()),
+            text: RenderedBytes::default(),
         };
         render(&completion, &mut out).unwrap();
         assert_eq!(
