@@ -15,6 +15,7 @@ All notable changes to infinitum are documented here.
 - _(engine)_ Reuse served prompt state across requests (#13)
 - _(engine)_ Scale RoPE positions for served long context (#14)
 - _(engine)_ Default serve's thinking budget (#15)
+- _(serve)_ Log operations as ninfer's server does (#16)
 
 ### Unreleased Bug Fixes
 
