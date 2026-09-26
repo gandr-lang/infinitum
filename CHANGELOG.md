@@ -7,6 +7,7 @@ All notable changes to infinitum are documented here.
 ### Unreleased Features
 
 - _(engine)_ Enforce unsafe documentation (#6)
+- _(engine)_ Run DFlash2 as an infinitum-owned round on ninfer (#4)
 
 ### Unreleased Bug Fixes
 
