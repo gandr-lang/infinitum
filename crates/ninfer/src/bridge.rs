@@ -510,6 +510,18 @@ pub mod ffi
         accepted_per_position: Vec<u64>,
     }
 
+    /// What the Engine's load reports.
+    #[derive(Debug)]
+    struct LoadRecord
+    {
+        /// The model name the artifact records.
+        model_name: String,
+        /// ninfer's name for its CUDA synchronization mode.
+        cuda_sync: String,
+        /// Weight bytes copied host to device.
+        weights_bytes: u64,
+    }
+
     /// The Engine's resolved capacities, as ninfer's server logs them at
     /// startup.
     #[derive(Debug)]
@@ -676,10 +688,10 @@ pub mod ffi
             outcome: &mut Outcome,
         );
 
-        /// The model name the artifact records.
-        fn model_name(
+        /// Read what the Engine's load reports.
+        fn load_summary(
             session: &Session,
-            name: &mut String,
+            record: &mut LoadRecord,
             outcome: &mut Outcome,
         );
 

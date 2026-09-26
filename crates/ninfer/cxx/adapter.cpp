@@ -656,9 +656,12 @@ void detokenize(const Session& session, rust::Slice<const std::int32_t> ids,
     } catch (...) { fail(outcome); }
 }
 
-void model_name(const Session& session, rust::String& name, Outcome& outcome) noexcept {
+void load_summary(const Session& session, LoadRecord& record, Outcome& outcome) noexcept {
     try {
-        name = rust::String::lossy(session.engine.load_summary().model_name);
+        const ::ninfer::LoadSummary load = session.engine.load_summary();
+        record.model_name                = rust::String::lossy(load.model_name);
+        record.cuda_sync                 = rust::String::lossy(load.cuda_sync_mode);
+        record.weights_bytes             = load.host_to_device_bytes;
         succeed(outcome);
     } catch (...) { fail(outcome); }
 }

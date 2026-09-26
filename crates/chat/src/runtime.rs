@@ -8,6 +8,18 @@ use crate::outcome::Tally;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ByteSize(pub u64);
 
+/// How a backend's load went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadReport
+{
+    /// Wall time from the start of opening to ready.
+    pub total: core::time::Duration,
+    /// Weight bytes uploaded to the device.
+    pub weights: ByteSize,
+    /// The backend's name for its CUDA synchronization mode.
+    pub cuda_sync: String,
+}
+
 /// The capacities a backend resolved when it opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capacity

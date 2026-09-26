@@ -24,6 +24,7 @@ struct ChatSink;
 struct CounterRecord;
 struct EngineConfig;
 struct GenerationRecord;
+struct LoadRecord;
 struct Outcome;
 struct ReviewSink;
 
@@ -105,16 +106,17 @@ void generate(Session& session, rust::Slice<const std::int32_t> prompt, std::uin
 void detokenize(const Session& session, rust::Slice<const std::int32_t> ids,
                 rust::Vec<std::uint8_t>& bytes, Outcome& outcome) noexcept;
 
-/// Read the model name the artifact records.
+/// Read what the Engine's load reports.
 ///
 /// # Specification
 /// - requires: `session` is open.
-/// - ensures: on success `name` holds the Engine's `load_summary().model_name` and
-///   `outcome.status` is `Completed`; on failure `outcome` holds the exception.
-/// - provides: the default public model id.
+/// - ensures: on success `record` holds the Engine's `load_summary()` model name, CUDA sync mode
+///   and host-to-device weight bytes, and `outcome.status` is `Completed`; on failure `outcome`
+///   holds the exception.
+/// - provides: the default public model id and the `engine ready` line.
 /// - fails: when ninfer throws; reported through `outcome`, never thrown.
 /// - panics: none.
-void model_name(const Session& session, rust::String& name, Outcome& outcome) noexcept;
+void load_summary(const Session& session, LoadRecord& record, Outcome& outcome) noexcept;
 
 /// Read the Engine's resolved capacities, as ninfer's server logs them at startup.
 ///

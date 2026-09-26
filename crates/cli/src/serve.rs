@@ -493,7 +493,9 @@ where
 
     use infinitum_chat::ChatBackend as _;
 
+    infinitum_serve::log_engine_start();
     let engine = infinitum_ninfer::ChatEngine::open(options, plan).map_err(ServeFailure::Engine)?;
+    infinitum_serve::log_engine_ready(engine.model_name(), engine.load());
     infinitum_serve::log_capacity(&engine.capacity().map_err(ServeFailure::Engine)?);
     let thinking_budget = server.default_thinking_budget.map_or(
         infinitum_chat::ThinkingBudget::Unlimited,

@@ -20,6 +20,8 @@ pub use crate::error::ApiError;
 pub use crate::error::Code;
 pub use crate::error::Param;
 pub use crate::oplog::log_capacity;
+pub use crate::oplog::log_engine_ready;
+pub use crate::oplog::log_engine_start;
 pub use crate::parse::Defaults;
 pub use crate::server::Access;
 pub use crate::server::ApiKey;

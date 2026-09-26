@@ -30,6 +30,7 @@ use infinitum_chat::FailureKind;
 use infinitum_chat::Finish;
 use infinitum_chat::GeneratedToolCall;
 use infinitum_chat::KvSizing;
+use infinitum_chat::LoadReport;
 use infinitum_chat::Marked;
 use infinitum_chat::ModelName;
 use infinitum_chat::PrefixReuse;
@@ -491,18 +492,22 @@ pub struct ChatEngine
     session: Session,
     /// The model name the artifact records.
     model: ModelName,
+    /// How the load went.
+    load: LoadReport,
 }
 
 impl ChatEngine
 {
-    /// Open an Engine for `options` running `plan`, and read its model name.
+    /// Open an Engine for `options` running `plan`, and read its load
+    /// summary.
     ///
     /// # Specification
     /// - requires: nothing.
     /// - ensures: on success the Engine is open as [`Session::open`] opens it,
-    ///   and the model name is the artifact's.
+    ///   the model name is the artifact's, and the load report carries the wall
+    ///   time of opening and the Engine's weight bytes and CUDA sync mode.
     /// - provides: the chat backend over ninfer.
-    /// - fails: as [`Session::open`] fails, or when reading the name throws.
+    /// - fails: as [`Session::open`] fails, or when reading the summary throws.
     /// - panics: none.
     ///
     /// # Errors
@@ -517,15 +522,37 @@ impl ChatEngine
         plan: DFlash2Plan,
     ) -> Result<Self, EngineFailure>
     {
+        let started = std::time::Instant::now();
         let session = Session::open(options, plan)?;
-        let mut model = String::new();
+        let total = started.elapsed();
+        let mut record = ffi::LoadRecord {
+            model_name: String::new(),
+            cuda_sync: String::new(),
+            weights_bytes: 0,
+        };
         let mut outcome = pending();
-        ffi::model_name(session.engine(), &mut model, &mut outcome);
+        ffi::load_summary(session.engine(), &mut record, &mut outcome);
         check(Operation::Open, outcome)?;
         return Ok(Self {
             session,
-            model: ModelName(model),
+            model: ModelName(record.model_name),
+            load: LoadReport {
+                total,
+                weights: ByteSize(record.weights_bytes),
+                cuda_sync: record.cuda_sync,
+            },
         });
+    }
+
+    /// How the load went.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn load(&self) -> &LoadReport
+    {
+        return &self.load;
     }
     /// The capacities the Engine resolved when it opened.
     ///

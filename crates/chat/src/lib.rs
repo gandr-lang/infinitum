@@ -61,5 +61,6 @@ pub use runtime::Capacity;
 pub use runtime::ContextCache;
 pub use runtime::CounterDigest;
 pub use runtime::KvSizing;
+pub use runtime::LoadReport;
 pub use runtime::RequestGauges;
 pub use runtime::RuntimeCounters;

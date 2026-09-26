@@ -974,6 +974,74 @@ pub fn throughput(
     });
 }
 
+/// Log the start of opening the Engine.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: `starting engine` is written at info, as ninfer's startup log
+///   writes it when the Engine phase begins.
+/// - provides: the first startup line.
+/// - fails: never; a failed write is dropped as every log write is.
+/// - panics: none.
+#[inline]
+pub fn log_engine_start()
+{
+    emit(&Record {
+        severity: Severity::Info,
+        message: String::from("starting engine"),
+    });
+}
+
+/// The line for an Engine that finished loading.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: `engine ready | <model> | total <duration> | weights <bytes> |
+///   CUDA sync <mode>`, the model made safe for one line, as ninfer's
+///   `engine_ready`.
+/// - provides: the load record.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 on one load.
+/// - witness: `tests::startup_lines_follow_ninfer`
+#[inline]
+#[must_use]
+pub fn engine_ready(
+    model: &infinitum_chat::ModelName,
+    load: &infinitum_chat::LoadReport,
+) -> Record
+{
+    return Record {
+        severity: Severity::Info,
+        message: format!(
+            "engine ready | {} | total {} | weights {} | CUDA sync {}",
+            Text(&model.0),
+            Duration(load.total.as_secs_f64()),
+            Bytes(load.weights.0),
+            load.cuda_sync
+        ),
+    };
+}
+
+/// Log the Engine's load.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: the [`engine_ready`] line is written.
+/// - provides: the server's load report at startup.
+/// - fails: never; a failed write is dropped as every log write is.
+/// - panics: none.
+#[inline]
+pub fn log_engine_ready(
+    model: &infinitum_chat::ModelName,
+    load: &infinitum_chat::LoadReport,
+)
+{
+    emit(&engine_ready(model, load));
+}
+
 /// Log the startup capacity lines.
 ///
 /// # Specification
@@ -1192,6 +1260,19 @@ mod tests
             second.message,
             "context cache | 3 active + 3 cached device states | host 8 states, 36.0 GiB KV | private 6 | shared 4 | anchors 2",
             "the enabled cache line"
+        );
+        assert_eq!(
+            super::engine_ready(
+                &infinitum_chat::ModelName(String::from("Qwen3.8-27B")),
+                &infinitum_chat::LoadReport {
+                    total: core::time::Duration::from_millis(95_400),
+                    weights: infinitum_chat::ByteSize(17 << 30_u32),
+                    cuda_sync: String::from("blocking"),
+                }
+            )
+            .message,
+            "engine ready | Qwen3.8-27B | total 1m 35.4s | weights 17.0 GiB | CUDA sync blocking",
+            "the load line"
         );
         summary.cache = infinitum_chat::ContextCache::RootOnly;
         assert_eq!(
