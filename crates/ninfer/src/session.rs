@@ -39,6 +39,8 @@ pub enum Operation
     Detokenize,
     /// Reading the resolved capacities.
     Capacity,
+    /// Reading what opening loaded.
+    LoadSummary,
 }
 
 impl core::fmt::Display for Operation
@@ -59,6 +61,7 @@ impl core::fmt::Display for Operation
             | Self::Generate => "generating",
             | Self::Detokenize => "detokenizing",
             | Self::Capacity => "reading the engine's capacity",
+            | Self::LoadSummary => "reading the engine's load summary",
         });
     }
 }

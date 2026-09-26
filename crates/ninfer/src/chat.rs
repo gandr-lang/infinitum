@@ -532,7 +532,7 @@ impl ChatEngine
         };
         let mut outcome = pending();
         ffi::load_summary(session.engine(), &mut record, &mut outcome);
-        check(Operation::Open, outcome)?;
+        check(Operation::LoadSummary, outcome)?;
         return Ok(Self {
             session,
             model: ModelName(record.model_name),
