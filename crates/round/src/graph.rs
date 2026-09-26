@@ -98,6 +98,24 @@ impl RoundGraph
         return &self.fragments;
     }
 
+    /// The fragments with their ids, in insertion order.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: the `n`th item is the `n`th fragment with the id naming it.
+    /// - provides: the id a fragment-by-fragment planner names when it refuses.
+    /// - fails: never.
+    /// - panics: none.
+    #[inline]
+    pub fn entries(&self) -> impl Iterator<Item = (FragmentId, &Fragment)>
+    {
+        return self
+            .fragments
+            .iter()
+            .enumerate()
+            .map(|(position, fragment)| return (FragmentId(position), fragment));
+    }
+
     /// The first position at which `self` and `other` differ.
     ///
     /// # Specification

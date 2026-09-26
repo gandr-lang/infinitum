@@ -16,6 +16,8 @@ pub enum BackendName
 {
     /// ninfer on CUDA, reached through its C++ engine.
     Ninfer,
+    /// Tenstorrent devices, reached through tt-mlir's kernel path.
+    Tenstorrent,
 }
 
 impl core::fmt::Display for BackendName
@@ -32,6 +34,7 @@ impl core::fmt::Display for BackendName
     {
         return f.write_str(match *self {
             | Self::Ninfer => "ninfer",
+            | Self::Tenstorrent => "tenstorrent",
         });
     }
 }
@@ -45,6 +48,9 @@ pub enum RefusalReason
     /// The graph differs from the backend's known fusion at this fragment,
     /// and the backend has no fragment-by-fragment lowering.
     NoKnownFusion(FragmentId),
+    /// The backend lowers fragment by fragment and has no lowering for the
+    /// fragment at this position.
+    NoLowering(FragmentId),
     /// The backend's fusion does not run at this draft width.
     UnsupportedWidth(DraftWidth),
     /// The backend's canonical graph could not be composed.
@@ -110,6 +116,12 @@ impl core::fmt::Display for Refusal
                 write!(
                     f,
                     "{backend} refuses the round: it differs from its known fusion at {at}"
+                )
+            },
+            | RefusalReason::NoLowering(at) => {
+                write!(
+                    f,
+                    "{backend} refuses the round: it has no lowering for {at}"
                 )
             },
             | RefusalReason::UnsupportedWidth(width) => {

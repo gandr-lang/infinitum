@@ -4,6 +4,8 @@
 //! through tt-mlir's TTIR-to-TTMetal kernel path and run on a Blackhole
 //! device. [`reference_accept`] is the host answer the device must agree
 //! with; [`Sample`] generates the verify blocks the differential compares on.
+//! [`Tenstorrent`] plans a round fragment by fragment; Accept is its one
+//! lowering.
 //! With the `device` feature, `AcceptProgram` builds and lowers the module
 //! in process, or loads one the pipeline tools lowered, and
 //! `TenstorrentDevice` runs it.
@@ -14,6 +16,7 @@ mod bridge;
 #[cfg(feature = "device")]
 mod device;
 mod digits;
+mod plan;
 mod samples;
 
 pub use accept::Acceptance;
@@ -63,6 +66,10 @@ pub use digits::compose;
 pub use digits::constant_planes;
 pub use digits::fill_tail;
 pub use digits::split;
+pub use plan::AcceptPlan;
+pub use plan::Lowering;
+pub use plan::RoundPlan;
+pub use plan::Tenstorrent;
 pub use samples::Sample;
 pub use samples::SampleCase;
 pub use samples::Seed;

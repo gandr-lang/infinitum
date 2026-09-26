@@ -1,6 +1,6 @@
 # infinitum-tenstorrent
 
-The Tenstorrent backend of the [infinitum](https://github.com/silvanshade-org/infinitum) engine, as a spike: the `Accept` fragment under sparse rejection at temperature zero, lowered through tt-mlir's TTIR-to-TTMetal kernel path and run on a Blackhole p150a.
+The Tenstorrent backend of the [infinitum](https://github.com/silvanshade-org/infinitum) engine, as a spike: the `Accept` fragment under sparse rejection at temperature zero, lowered through tt-mlir's TTIR-to-TTMetal kernel path and run on a Blackhole p150a. The findings, rung by rung, are in [`REPORT.md`](REPORT.md).
 
 ## The fragment on the device
 
@@ -14,9 +14,13 @@ Every value the device touches is bfloat16 and every index is an integer below 1
 
 `reference_accept` is the answer the device must match: each column's target is the argmax over the valid vocabulary with the lowest id winning a tie, as ninfer's greedy acceptance breaks it; the accepted length is the first column whose draft differs from its target. `Sample` generates verify blocks for full acceptance, rejection at the first draft, rejection mid-block, and planted ties, with padding logits above every valid one.
 
+## Planning
+
+`Tenstorrent` implements `infinitum_round::Backend` fragment by fragment, and Accept under sparse rejection is its one lowering. A round plans only when every fragment lowers, so today every round is refused at its first fragment with `NoLowering`. `Tenstorrent::plan_fragment` lowers one fragment on its own. It takes the draft width from the round's DFlash2 block forward and refuses K = 4, 8, 9, 10, and 14 with `UnsupportedWidth`: at those widths the pinned pipeline aborts the process instead of reporting a diagnostic. Planning is pure Rust and builds on every host.
+
 ## The device
 
-The `device` feature adds the C++ host (`cxx/host.{h,cpp}`, C++26, behind a `cxx` bridge): it builds the module with MLIR builder calls, runs `ttir-to-ttmetal-pipeline` and the flatbuffer translation in process, and submits the program through tt-mlir's runtime. `accept-differential` compares the device with the reference sample by sample and times every call.
+The `device` feature adds the C++ host (`cxx/host.{h,cpp}`, C++26, behind a `cxx` bridge): it builds the module with MLIR builder calls, runs `ttir-to-ttmetal-pipeline` and the flatbuffer translation in process, and submits the program through tt-mlir's runtime. `accept-differential` compares the device with the reference sample by sample and times every call. Its `round` command starts from infinitum's planner: it plans the canonical DFlash2 round, lowers the round's Accept fragment, runs each sample as one round on the device, and offers every device answer to an `infinitum_round::Preview` under the request's budget.
 
 Building with `device` needs a tt-mlir build with the runtime enabled and the LLVM/MLIR toolchain it was built against. tt-mlir builds that toolchain with clang and without RTTI, so the host is compiled the same way:
 
@@ -35,6 +39,7 @@ accept-differential system-desc --out p150a.ttsys
 accept-differential run --system-desc p150a.ttsys --drafts 15 --prefix device
 accept-differential emit-ttir --drafts 15 > accept.mlir   # for the pipeline tools
 accept-differential run --flatbuffer accept.ttm --drafts 15
+accept-differential round --system-desc p150a.ttsys --drafts 15 --budget 70
 ```
 
 ## License
