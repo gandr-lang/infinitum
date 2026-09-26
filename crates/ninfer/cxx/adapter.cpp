@@ -77,6 +77,14 @@ Finish to_finish(::ninfer::FinishReason reason) noexcept {
 /// before it returns.
 class Controller final : public ::ninfer::RoundController {
 public:
+    /// Attach to `sink`.
+    ///
+    /// # Specification
+    /// - requires: `sink` outlives every `review` before `detach`.
+    /// - ensures: the controller is attached to `sink`.
+    /// - provides: the controller `generate` hands to the Engine.
+    /// - fails: never.
+    /// - panics: none.
     explicit Controller(ReviewSink& sink) noexcept : sink_(&sink) {}
 
     /// Review one round through the Rust sink.
@@ -121,12 +129,29 @@ private:
 /// Detaches the controller on every exit from generate.
 class Detach {
 public:
+    /// Guard `controller` until the end of the enclosing scope.
+    ///
+    /// # Specification
+    /// - requires: `controller` outlives the guard.
+    /// - ensures: the guard refers to `controller`.
+    /// - provides: the scope `generate` detaches on leaving.
+    /// - fails: never.
+    /// - panics: none.
     explicit Detach(Controller& controller) noexcept : controller_(controller) {}
     Detach(const Detach&)            = delete;
     Detach& operator=(const Detach&) = delete;
     Detach(Detach&&)                 = delete;
     Detach& operator=(Detach&&)      = delete;
-    ~Detach() { controller_.detach(); }
+    /// Detach the controller, on every exit from the guard's scope, exceptional ones included.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: `controller.detach()` has returned, so no later `review` reaches the sink and
+    ///   none is still inside it.
+    /// - provides: the lifetime cut the bridge's `# Safety` section relies on.
+    /// - fails: never.
+    /// - panics: none.
+    ~Detach() noexcept { controller_.detach(); }
 
 private:
     Controller& controller_;
@@ -139,7 +164,8 @@ private:
 /// - ensures: the request asks for at most `budget` tokens with temperature 0, top-k off, top-p 1,
 ///   min-p 0, no penalties and seed 0.
 /// - provides: the options every generation uses.
-/// - fails: never.
+/// - fails: when building the options throws, such as on allocation failure; it is not
+///   `noexcept`, and its one caller, `generate`, calls it inside its catch-all.
 /// - panics: none.
 ::ninfer::RequestOptions greedy(std::uint32_t budget) {
     ::ninfer::RequestOptions request;
