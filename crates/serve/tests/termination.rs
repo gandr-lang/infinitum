@@ -4,6 +4,7 @@
 //! every other test running beside it. So this test runs alone, in its own
 //! binary, and signals that process.
 
+#[cfg(unix)]
 extern crate alloc;
 
 #[cfg(test)]
