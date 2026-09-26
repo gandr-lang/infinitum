@@ -12,6 +12,10 @@ All notable changes to infinitum are documented here.
 
 - _(repo)_ Publish and pull the CI image under silvanshade-org (#5)
 
+### Unreleased Configuration
+
+- _(config)_ Let mise select Rust toolchain (#3)
+
 ## 0.0.0 - 2026-09-22
 
 ### 0.0.0 Features
