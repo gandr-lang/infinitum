@@ -96,6 +96,20 @@ path = "crates/round"
 [workspace.dependencies.infinitum-serve]
 path = "crates/serve"
 
+# The local wall clock that stamps each operational log line, as ninfer's
+# service log stamps it through `localtime_r`. `tz-system` finds the system
+# zone from `TZ` or `/etc/localtime`, and `tzdb-zoneinfo` resolves a zone
+# name `TZ` gives against the system database. The bundled and concatenated
+# databases serve platforms without one, `tz-fat` only widens historical
+# transitions, and `perf-inline` trades build time for speed a few lines a
+# second do not need; all stay off.
+# consumers:
+# - infinitum-serve
+[workspace.dependencies.jiff]
+version = "0.2.37"
+default-features = false
+features = ["std", "tz-system", "tzdb-zoneinfo"]
+
 # The specification attribute: `#[quenchant::spec(...)]` states an obligation
 # beside the code it constrains. The release is a pre-release, so the
 # requirement names it exactly; a caret requirement would not match it at all.

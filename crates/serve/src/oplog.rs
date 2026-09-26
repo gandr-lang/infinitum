@@ -602,13 +602,12 @@ impl RequestShape
     }
 }
 
-/// Write `record` to standard error as one service log line.
+/// Write `record` to standard error as one service log line, stamped now.
 ///
 /// # Specification
 /// - requires: nothing.
-/// - ensures: one line, `<level> <message>`, the level padded to five
-///   characters as ninfer's service presentation pads it (`INFO `, `WARN `,
-///   `ERROR`), is written to standard error, or nothing when it is closed.
+/// - ensures: the [`service_line`] for `record` at the current local time is
+///   written to standard error, or nothing when it is closed.
 /// - provides: the operational log's sink.
 /// - fails: never; a closed standard error drops the line, as a logger must not
 ///   fail the request it describes.
@@ -618,12 +617,44 @@ pub fn emit(record: &Record)
 {
     use std::io::Write as _;
 
+    let _dropped = writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        service_line(&jiff::Zoned::now(), record)
+    );
+}
+
+/// One service log line for `record` stamped at `at`.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: `YYYY-MM-DD HH:MM:SS.mmm`, the civil time at `at` with its
+///   milliseconds truncated, two spaces, the level padded to five characters
+///   (`INFO `, `WARN `, `ERROR`), a space and the message, as ninfer's service
+///   presentation formats a line.
+/// - provides: [`emit`]'s line.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 on each level and a stamp one nanosecond short of the next
+///   millisecond.
+/// - witness: `tests::lines_carry_ninfers_stamp_and_level`
+fn service_line(
+    at: &jiff::Zoned,
+    record: &Record,
+) -> String
+{
     let level = match record.severity {
         | Severity::Info => "INFO ",
         | Severity::Warning => "WARN ",
         | Severity::Error => "ERROR",
     };
-    let _dropped = writeln!(std::io::stderr().lock(), "{level} {}", record.message);
+    return format!(
+        "{}  {level} {}",
+        at.strftime("%Y-%m-%d %H:%M:%S%.3f"),
+        record.message
+    );
 }
 
 /// A request's events, logging its start at submission and forwarding every
@@ -1175,6 +1206,26 @@ mod tests
             "listening on http://127.0.0.1:18031 | model qwen  | auth disabled",
             "an open server, its id made safe"
         );
+    }
+
+    #[test]
+    fn lines_carry_ninfers_stamp_and_level()
+    {
+        let at = jiff::civil::date(2026, 9, 26)
+            .at(4, 5, 6, 123_999_999)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap();
+        for (severity, expected) in [
+            (Severity::Info, "2026-09-26 04:05:06.123  INFO  ready"),
+            (Severity::Warning, "2026-09-26 04:05:06.123  WARN  ready"),
+            (Severity::Error, "2026-09-26 04:05:06.123  ERROR ready"),
+        ] {
+            let record = super::Record {
+                severity,
+                message: String::from("ready"),
+            };
+            assert_eq!(super::service_line(&at, &record), expected, "{severity:?}");
+        }
     }
 
     #[test]

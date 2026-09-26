@@ -9,3 +9,8 @@ allow-unwrap-in-tests = true
 
 # Product names the documentation uses as words rather than code.
 doc-valid-idents = ["DFlash2", ".."]
+
+# `jiff` pins `jiff-static` to its own version through a never-true
+# `cfg(any())` target table. Cargo metadata still lists that edge, so its
+# `syn` 2 appears beside `clap_derive`'s `syn` 3 though no build compiles it.
+allowed-duplicate-crates = ["syn"]
