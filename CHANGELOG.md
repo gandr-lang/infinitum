@@ -21,6 +21,7 @@ All notable changes to infinitum are documented here.
 ### Unreleased Bug Fixes
 
 - _(repo)_ Generate the changelog as the squash will land it (#2)
+- _(serve)_ Gate the termination test's alloc import to unix (#20)
 
 ### Unreleased Continuous Integration
 
