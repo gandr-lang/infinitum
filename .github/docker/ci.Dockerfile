@@ -1,5 +1,6 @@
-# The Linux CI image carries the pinned toolchain and the CI subset of mise
-# tools. Pin files are copied, never retyped. The base digest is a rebuild
+# The Linux CI image carries the pinned toolchain, the CI subset of mise
+# tools, and the matching Dylint driver. Pin files are copied, never retyped.
+# The base digest is a rebuild
 # trigger, not a tag input: rotating it republishes the same pin-file tag, so
 # the workflow switch needs no independent update.
 ARG UBUNTU_BASE=docker.io/library/ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
@@ -9,9 +10,9 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
 # rustup needs curl and certificates; Rust linking needs build-essential.
-# Cargo Git sources need git.
+# git2's openssl-sys needs pkg-config and libssl-dev; Cargo Git sources need git.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config \
+    && apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Build tools as UID 1000. Job steps run as root to write runner-owned mounts.
@@ -61,15 +62,57 @@ RUN --mount=type=secret,id=github_token,uid=1000,required=false set -eux; \
     mise install
 
 # Cargo resolves its subcommands by name; expose pinned binaries without shims.
-RUN ln -sf "$(mise which cargo-nextest)" /opt/ci/.cargo/bin/cargo-nextest
+RUN set -eux; \
+    for tool in cargo-dylint dylint-link cargo-nextest; do \
+        ln -sf "$(mise which "$tool")" "/opt/ci/.cargo/bin/$tool"; \
+    done
 
 # act invokes JavaScript actions through PATH rather than the hosted runner's
 # bundled Node. Expose the pinned interpreter.
 RUN ln -sf "$(mise which node)" /opt/ci/.local/bin/node
 
+WORKDIR /opt/ci/warmup/app
+
+# A bare `cargo dylint list` does not build the compiler driver. Load a small
+# disposable library against a stub crate to bake the rustc-private driver for
+# the toolchain pin; the external quenchant library stays an exact CI cache.
+RUN set -eux; \
+    TC="$(rustup show active-toolchain | awk '{print $1}')"; \
+    mkdir -p /opt/ci/warmup/gates/src /opt/ci/warmup/app/src; \
+    printf '[package]\nname = "dylint-warmup-gates"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\n' > /opt/ci/warmup/gates/Cargo.toml; \
+    printf '%s\n' \
+        '#![feature(rustc_private)]' \
+        '' \
+        'extern crate rustc_driver;' \
+        'extern crate rustc_lint;' \
+        'extern crate rustc_session;' \
+        '' \
+        'use std::ffi::CString;' \
+        'use std::os::raw::c_char;' \
+        '' \
+        'use rustc_lint::LintStore;' \
+        'use rustc_session::Session;' \
+        '' \
+        '#[no_mangle]' \
+        'pub extern "C" fn dylint_version() -> *mut c_char {' \
+        '    CString::new("0.1.0").unwrap().into_raw()' \
+        '}' \
+        '' \
+        '#[no_mangle]' \
+        'pub extern "C" fn register_lints(_sess: &Session, _store: &mut LintStore) {}' \
+        > /opt/ci/warmup/gates/src/lib.rs; \
+    printf '[package]\nname = "dylint-warmup-app"\nversion = "0.1.0"\nedition = "2021"\n' > /opt/ci/warmup/app/Cargo.toml; \
+    printf 'fn main() {}\n' > /opt/ci/warmup/app/src/main.rs; \
+    cargo build --manifest-path /opt/ci/warmup/gates/Cargo.toml --release; \
+    mv "/opt/ci/warmup/gates/target/release/libdylint_warmup_gates.so" "/opt/ci/warmup/gates/target/release/libdylint_warmup_gates@${TC}.so"; \
+    DYLINT_LIBRARY_PATH=/opt/ci/warmup/gates/target/release cargo dylint --lib dylint_warmup_gates --no-deps; \
+    ls -l "/opt/ci/.dylint_drivers/${TC}/dylint-driver"; \
+    rm -rf /opt/ci/warmup
+
 # The runner overrides HOME. Explicit homes retain the image's populated
 # tools, while root can write the workspace and runner file-command mounts.
 ENV MISE_DATA_DIR=/opt/ci/.local/share/mise \
-    MISE_CACHE_DIR=/opt/ci/.cache/mise
+    MISE_CACHE_DIR=/opt/ci/.cache/mise \
+    DYLINT_DRIVER_PATH=/opt/ci/.dylint_drivers
 USER root
 WORKDIR /opt/ci

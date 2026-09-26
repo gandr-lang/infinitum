@@ -115,6 +115,38 @@ jobs:
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.9.12
+      # Policy caches never use a restore prefix: Cargo can consider a library
+      # from another Git revision fresh. The metadata revision is in Cargo.toml.
+      # Save inside the job, before rust-cache prunes target/ at post-job time.
+      - &restore-dylint-drivers
+        name: restore Dylint drivers
+        id: dylint-drivers-restore
+        if: *without-image
+        uses: &cache-restore actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &dylint-drivers ~/.dylint_drivers
+          key: dylint-drivers-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'mise.toml', 'mise.lock') }}
+      - &restore-dylint-library
+        name: restore Dylint library
+        id: dylint-library-restore
+        uses: *cache-restore
+        with:
+          path: &dylint-library target/dylint
+          key: dylint-library-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'mise.toml', 'mise.lock', 'Cargo.toml', 'Cargo.lock') }}
+      - &save-dylint-library
+        name: save Dylint library
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.dylint-library-restore.outputs.cache-hit != 'true' }}
+        uses: &cache-save actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *dylint-library
+          key: ${{ steps.dylint-library-restore.outputs.cache-primary-key }}
+      - &save-dylint-drivers
+        name: save Dylint drivers
+        if: ${{ needs.ci-image-ref.outputs.ref == '' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.dylint-drivers-restore.outputs.cache-hit != 'true' }}
+        uses: *cache-save
+        with:
+          path: *dylint-drivers
+          key: ${{ steps.dylint-drivers-restore.outputs.cache-primary-key }}
       - &upload-test-report
         name: upload test report
         if: always()
@@ -271,6 +303,26 @@ jobs:
       - name: lint every target with the published instrumentation
         run: cargo clippy --locked --workspace --all-targets --features anodized -- --deny warnings
 
+  # The external plugin checks all local targets on every Rust PR. The image
+  # carries its driver; the bare-runner fallback installs the same pinned tools
+  # and restores the exact compiler- and revision-matched policy artifacts.
+  cargo-dylint-crate:
+    name: check quenchant compiler policy
+    needs: *rust-needs
+    if: *rust-lane
+    runs-on: *linux
+    permissions: *image-read-permissions
+    container: *ci-image # zizmor: ignore[unpinned-images]
+    steps:
+      - *git-checkout
+      - *setup-rust
+      - *restore-dylint-drivers
+      - *restore-dylint-library
+      - *install-policy-tools
+      - name: lint every workspace target
+        run: mise run check:dylint
+      - *save-dylint-library
+      - *save-dylint-drivers
   # The CI consumer for the treefmt/rumdl/typos/sizelint/tombi/oxfmt configs:
   # covers markdown, TOML, JSON/YAML and Rust formatting in one pass, so it
   # runs unconditionally — it is the job that must see a markdown-only change

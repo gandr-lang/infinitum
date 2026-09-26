@@ -47,12 +47,13 @@ weave-mcp = "github:ataraxy-labs/weave"
 # resolution misses, and that hazard recurs with every upstream default
 # change.
 #
-# The formatter pins below are the floor: `treefmt.toml` names each of them by
-# command, and treefmt refuses to start when a configured formatter's command
-# is absent, so a pin and its formatter entry move together. This tree carries
-# no Dylint policy and no shell sources, so the Dylint and shellcheck pins the
-# shared set offers are absent along with their formatter entry.
+# Formatter pins below are required by treefmt; the Dylint binary and linker
+# match the compiler-coupled quenchant plugin loaded by `check:dylint`. No shell
+# sources exist here, so the shellcheck pin is absent with its formatter.
 [tools]
+# Dylint builds the pinned Git library against this version of its driver.
+"cargo:cargo-dylint" = "6.0.4"
+"cargo:dylint-link" = "6.0.4"
 "cargo:tirith" = "0.4.0"
 "github:aubepkg/aube" = "2.2.4"
 # Retain across languages: project setup initializes the source index.

@@ -657,6 +657,10 @@ mod tests
     use super::pull_request_reference;
 
     /// The reference used throughout the request tests.
+    ///
+    /// # Specification
+    /// - ensures: returns the `changelog-squash` branch as a pull-request
+    ///   reference shared by the request tests.
     fn reference() -> PullRequestReference
     {
         return PullRequestReference(String::from("changelog-squash"));
