@@ -595,6 +595,8 @@ impl Session
             },
             host_state_slots: options.host_state().0,
             host_kv_bytes: options.host_kv().0,
+            rope_scaling_factor: f32::from(options.rope_factor()),
+            rope_scaling_original_context: u32::from(options.rope_threshold()),
             pending_timeout_ms: core::num::NonZeroU32::from(options.pending_timeout()).get(),
             draft_width: core::num::NonZeroU32::from(plan.width()).get(),
             cuda_graph: match options.cuda_graph() {

@@ -23,6 +23,8 @@ use infinitum_ninfer::KvStorage;
 use infinitum_ninfer::Ninfer;
 use infinitum_ninfer::PendingTimeout;
 use infinitum_ninfer::PrefillChunk;
+use infinitum_ninfer::RopeFactor;
+use infinitum_ninfer::RopeThreshold;
 use infinitum_ninfer::StateSlots;
 use infinitum_round::Backend as _;
 use infinitum_round::BuildFailure;
@@ -74,6 +76,13 @@ pub struct Server
     /// Pinned host memory for reusable KV, in MiB.
     #[arg(long, value_name = "MIB", default_value = "8192")]
     host_kv_mib: HostKvBytes,
+    /// How far `RoPE` positions stretch past `--rope-scaling-original-context`,
+    /// one to sixteen; one leaves them unscaled.
+    #[arg(long, value_name = "FACTOR", default_value = "1")]
+    rope_scaling_factor: RopeFactor,
+    /// The native position threshold past which `RoPE` positions scale.
+    #[arg(long, value_name = "POSITIONS", default_value = "262144")]
+    rope_scaling_original_context: RopeThreshold,
     /// The output limit of a request that names none; the Engine also clamps
     /// it to the context left after the prompt.
     #[arg(long, value_name = "TOKENS", default_value = "8192")]
@@ -297,8 +306,8 @@ fn plan(server: &Server) -> Result<DFlash2Plan, ServeFailure>
 /// - requires: nothing.
 /// - ensures: on success the options carry the artifact, device, context, KV
 ///   capacity (the context ceiling when absent), KV storage, prefill chunk,
-///   concurrency, context-cache capacities, pending timeout, CUDA graph choice
-///   and chat template the flags name.
+///   concurrency, context-cache capacities, `RoPE` scaling, pending timeout,
+///   CUDA graph choice and chat template the flags name.
 /// - provides: every Engine option `serve` sets, checked before an Engine
 ///   opens.
 /// - fails: when `--kv-capacity` is a token count below `--max-context`.
@@ -334,6 +343,10 @@ fn engine_options(server: &Server) -> Result<EngineOptions, ServeFailure>
             .map_or(DeviceStateSlots::PerLane, DeviceStateSlots::Exactly),
         server.host_state_slots,
         server.host_kv_mib,
+    )
+    .with_rope_scaling(
+        server.rope_scaling_factor,
+        server.rope_scaling_original_context,
     );
     return match server.kv_capacity {
         | Some(capacity) => options

@@ -1,7 +1,7 @@
 //! How an Engine is opened: the artifact, the device, the context ceiling,
 //! the KV cache's capacity and storage, the prefill chunk, the concurrency,
-//! the context cache's state and host KV capacities, the pending timeout,
-//! CUDA graph capture, and the chat template.
+//! the context cache's state and host KV capacities, `RoPE` position scaling,
+//! the pending timeout, CUDA graph capture, and the chat template.
 
 /// The logical ceiling of one request in tokens, prompt and generation
 /// together. The Engine also sizes its KV cache from it, so a small ceiling
@@ -506,6 +506,152 @@ impl core::error::Error for HostKvOutOfRange
 {
 }
 
+/// How far `RoPE` positions stretch past the native threshold: a finite
+/// factor from one to sixteen, one leaving positions unscaled.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RopeFactor(f32);
+
+impl RopeFactor
+{
+    /// Unscaled positions, ninfer's default.
+    pub const ONE: Self = Self(1.0);
+}
+
+// The factor is never NaN: `ONE` is one and parsing admits only `[1,16]`, so
+// equality is reflexive.
+impl Eq for RopeFactor
+{
+}
+
+impl From<RopeFactor> for f32
+{
+    /// Unwrap the factor.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn from(factor: RopeFactor) -> Self
+    {
+        return factor.0;
+    }
+}
+
+impl core::str::FromStr for RopeFactor
+{
+    type Err = RopeFactorOutOfRange;
+
+    /// Parse a decimal factor from one to sixteen.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the factor is `text` rounded to `f32`, and `text`
+    ///   read as `f64` lies in `[1,16]`, the range ninfer's server checks in
+    ///   double precision.
+    /// - provides: `--rope-scaling-factor`.
+    /// - fails: on a value outside the range, NaN, or a non-numeric string.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`RopeFactorOutOfRange`]: as stated.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 either side of both ends of the range.
+    /// - witness: `tests::rope_scaling_parses_ninfers_ranges`
+    #[inline]
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        let wide = text
+            .parse::<f64>()
+            .map_err(|_malformed| return RopeFactorOutOfRange)?;
+        if !(1.0_f64 ..= 16.0_f64).contains(&wide) {
+            return Err(RopeFactorOutOfRange);
+        }
+        return text
+            .parse::<f32>()
+            .map(Self)
+            .map_err(|_malformed| return RopeFactorOutOfRange);
+    }
+}
+
+/// A `RoPE` scaling factor outside one to sixteen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RopeFactorOutOfRange;
+
+impl core::fmt::Display for RopeFactorOutOfRange
+{
+    /// Render the failure.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result
+    {
+        return f.write_str("rope-scaling-factor must be in [1,16]");
+    }
+}
+
+impl core::error::Error for RopeFactorOutOfRange
+{
+}
+
+/// The native position threshold past which `RoPE` positions are scaled.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RopeThreshold(u32);
+
+impl RopeThreshold
+{
+    /// ninfer's default: 262144 positions.
+    pub const DEFAULT: Self = Self(1_u32 << 18_u32);
+}
+
+impl From<RopeThreshold> for u32
+{
+    /// Unwrap the threshold.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn from(threshold: RopeThreshold) -> Self
+    {
+        return threshold.0;
+    }
+}
+
+impl core::str::FromStr for RopeThreshold
+{
+    type Err = core::num::TryFromIntError;
+
+    /// Parse a non-negative decimal position count no larger than
+    /// `i32::MAX`, ninfer's server's range.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the threshold is the parsed value.
+    /// - provides: `--rope-scaling-original-context`.
+    /// - fails: on a negative value, anything above `i32::MAX`, or a
+    ///   non-numeric string.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`core::num::TryFromIntError`]: as stated; a non-numeric string is
+    ///   reported as out of range too.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at zero, minus one, and either side of `i32::MAX`.
+    /// - witness: `tests::rope_scaling_parses_ninfers_ranges`
+    #[inline]
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        let signed = text.parse::<i32>().unwrap_or(-1_i32);
+        return u32::try_from(signed).map(Self);
+    }
+}
+
 /// How long a request may wait for admission, in milliseconds; past it the
 /// Engine refuses the request with a queue timeout.
 #[repr(transparent)]
@@ -708,6 +854,10 @@ pub struct EngineOptions
     host_state: StateSlots,
     /// Host KV capacity.
     host_kv: HostKvBytes,
+    /// `RoPE` scaling factor.
+    rope_factor: RopeFactor,
+    /// `RoPE` native threshold.
+    rope_threshold: RopeThreshold,
     /// The pending timeout.
     pending_timeout: PendingTimeout,
     /// CUDA graph capture.
@@ -743,6 +893,8 @@ impl EngineOptions
             device_state: DeviceStateSlots::PerLane,
             host_state: StateSlots::HOST_DEFAULT,
             host_kv: HostKvBytes::DEFAULT,
+            rope_factor: RopeFactor::ONE,
+            rope_threshold: RopeThreshold::DEFAULT,
             pending_timeout: PendingTimeout::DEFAULT,
             cuda_graph,
             chat_template: ChatTemplate::Artifact,
@@ -963,6 +1115,48 @@ impl EngineOptions
         return self.host_kv;
     }
 
+    /// The same options with `RoPE` positions past `threshold` scaled by
+    /// `factor`.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub fn with_rope_scaling(
+        self,
+        factor: RopeFactor,
+        threshold: RopeThreshold,
+    ) -> Self
+    {
+        return Self {
+            rope_factor: factor,
+            rope_threshold: threshold,
+            ..self
+        };
+    }
+
+    /// The `RoPE` scaling factor; one unless set.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn rope_factor(&self) -> RopeFactor
+    {
+        return self.rope_factor;
+    }
+
+    /// The `RoPE` native threshold; ninfer's 262144 unless set.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn rope_threshold(&self) -> RopeThreshold
+    {
+        return self.rope_threshold;
+    }
+
     /// The same options with `template` rendering chat prompts.
     ///
     /// # Specification
@@ -1056,6 +1250,9 @@ mod tests
     use super::MalformedKvCapacity;
     use super::PendingTimeout;
     use super::PrefillChunk;
+    use super::RopeFactor;
+    use super::RopeFactorOutOfRange;
+    use super::RopeThreshold;
     use super::StateSlots;
     use super::UnknownCudaGraph;
     use super::UnknownKvStorage;
@@ -1228,6 +1425,49 @@ mod tests
             HostKvBytes::from_str(&overflowing),
             Err(HostKvOutOfRange),
             "one MiB more overflows"
+        );
+    }
+
+    /// The factor admits one and sixteen and refuses just outside them and
+    /// NaN; the threshold admits zero and `i32::MAX` and refuses minus one and
+    /// one past it.
+    #[test]
+    fn rope_scaling_parses_ninfers_ranges()
+    {
+        assert_eq!(
+            RopeFactor::from_str("1").map(f32::from),
+            Ok(1.0_f32),
+            "unscaled"
+        );
+        assert_eq!(
+            RopeFactor::from_str("16").map(f32::from),
+            Ok(16.0_f32),
+            "the widest"
+        );
+        assert_eq!(
+            RopeFactor::from_str("2.4371").map(f32::from),
+            Ok(2.4371_f32),
+            "the served factor"
+        );
+        for text in ["0.999", "16.001", "NaN", "x"] {
+            assert_eq!(
+                RopeFactor::from_str(text),
+                Err(RopeFactorOutOfRange),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            RopeThreshold::from_str("0").map(u32::from),
+            Ok(0_u32),
+            "zero"
+        );
+        let widest = i32::MAX.to_string();
+        assert!(RopeThreshold::from_str(&widest).is_ok(), "i32::MAX");
+        let past = (i64::from(i32::MAX) + 1).to_string();
+        assert!(RopeThreshold::from_str(&past).is_err(), "one past i32::MAX");
+        assert!(
+            RopeThreshold::from_str("-1").is_err(),
+            "no negative threshold"
         );
     }
 

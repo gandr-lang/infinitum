@@ -490,6 +490,8 @@ std::unique_ptr<Session> open_session(const EngineConfig& config, Outcome& outco
         }
         options.context_cache.host_state_slots       = config.host_state_slots;
         options.context_cache.host_kv_capacity_bytes = config.host_kv_bytes;
+        options.rope_scaling_factor                  = config.rope_scaling_factor;
+        options.rope_scaling_original_context        = config.rope_scaling_original_context;
         options.pending_timeout_ms        = config.pending_timeout_ms;
         options.use_cuda_graph            = config.cuda_graph == CudaGraph::On;
         options.speculative.backend       = ::ninfer::SpeculativeBackend::DFlash2;
