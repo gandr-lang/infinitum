@@ -16,6 +16,7 @@
 #include "ttmlir/RegisterAll.h"
 #include "ttmlir/Target/TTMetal/TTMetalToFlatbuffer.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -290,6 +291,43 @@ mlir::OwningOpRef<mlir::ModuleOp> verified_accept(Session& session, const Accept
     return module;
 }
 
+/// The bytes `memcpy` writes when reading `host` back: TTMetal copies the description's physical
+/// size, TTNN the tensor's physical volume. TTNN's description leaves the physical volume unset,
+/// and TTMetal's volume is the logical one, so the larger of the two covers either runtime. Both
+/// runtimes implement every call made here.
+std::size_t copy_bytes(const ::tt::runtime::Tensor& host) {
+    const auto desc = ::tt::runtime::getTensorDesc(host);
+    return std::max(desc.sizeBytes(), std::size_t{::tt::runtime::getTensorVolume(host)} *
+                                          ::tt::runtime::getTensorElementSize(host));
+}
+
+/// Append `host`'s bfloat16 values to `values`, or say why not. Only a dense output is read: one
+/// whose copy holds exactly its logical values.
+bool read_bf16(const ::tt::runtime::Tensor& host, rust::Vec<std::uint16_t>& values,
+               std::string& why) {
+    const auto desc = ::tt::runtime::getTensorDesc(host);
+    if (desc.dataType != ::tt::target::DataType::BFloat16) {
+        why = "an output is not bfloat16";
+        return false;
+    }
+    std::size_t logical = 1;
+    for (const auto extent : desc.shape) {
+        logical *= extent;
+    }
+    const auto bytes = copy_bytes(host);
+    if (bytes != logical * sizeof(std::uint16_t)) {
+        why = "an output copies " + std::to_string(bytes) + " bytes for " +
+              std::to_string(logical) + " bfloat16 values; a padded output is not read";
+        return false;
+    }
+    std::vector<std::uint16_t> dense(logical, 0);
+    ::tt::runtime::memcpy(dense.data(), host, ::tt::target::DataType::BFloat16);
+    for (const std::uint16_t value : dense) {
+        values.push_back(value);
+    }
+    return true;
+}
+
 } // namespace
 
 Program::Program(::tt::runtime::Binary binary) noexcept : binary(std::move(binary)) {}
@@ -463,17 +501,85 @@ void run_accept(Device& device, const Program& program, rust::Slice<const std::u
         stage = "reading back";
         start = Clock::now();
         output.values.clear();
-        std::vector<std::uint16_t> values;
         for (auto& tensor : result) {
-            auto host       = ::tt::runtime::toHost(tensor, true);
-            const auto desc = ::tt::runtime::getTensorDesc(host.at(0));
-            values.assign(desc.volume(), 0);
-            ::tt::runtime::memcpy(values.data(), host.at(0), ::tt::target::DataType::BFloat16);
-            for (const std::uint16_t value : values) {
-                output.values.push_back(value);
+            auto host = ::tt::runtime::toHost(tensor, true);
+            if (host.size() != 1) {
+                fail(outcome, Status::Runtime,
+                     "an output came back as " + std::to_string(host.size()) + " host tensors");
+                return;
+            }
+            std::string why;
+            if (!read_bf16(host[0], output.values, why)) {
+                fail(outcome, Status::Runtime, why);
+                return;
             }
         }
         output.readback_ns = elapsed_ns(start);
+        complete(outcome);
+    } catch (...) {
+        fail_current(outcome, stage);
+    }
+}
+
+void probe_program(Device& device, const Program& program, std::uint32_t calls,
+                   ProbeOutput& output, Outcome& outcome) noexcept {
+    std::string_view stage = "reading the program's inputs";
+    try {
+        const auto descs = program.binary.getProgramInputs(0);
+        std::vector<std::vector<std::byte>> storage;
+        std::vector<::tt::runtime::Tensor> host;
+        storage.reserve(descs.size());
+        host.reserve(descs.size());
+        stage = "creating the input tensors";
+        for (const auto& desc : descs) {
+            storage.emplace_back(desc.sizeBytes(), std::byte{0});
+            host.push_back(::tt::runtime::createBorrowedHostTensor(storage.back().data(), desc));
+        }
+        const auto move_inputs = [&] {
+            std::vector<::tt::runtime::Tensor> moved;
+            moved.reserve(host.size());
+            for (std::uint32_t index = 0; index < host.size(); ++index) {
+                const auto layout = ::tt::runtime::getLayout(program.binary, 0, index);
+                moved.push_back(::tt::runtime::toLayout(host[index], device.device, layout, true));
+            }
+            return moved;
+        };
+        std::size_t read_bytes = 0;
+        const auto read_back   = [&](std::vector<::tt::runtime::Tensor>& results) {
+            for (auto& tensor : results) {
+                for (auto& copy : ::tt::runtime::toHost(tensor, true)) {
+                    std::vector<std::byte> bytes(copy_bytes(copy), std::byte{0});
+                    ::tt::runtime::memcpy(bytes.data(), copy);
+                    read_bytes += bytes.size();
+                }
+                ::tt::runtime::deallocateTensor(tensor, true);
+            }
+        };
+        stage = "running with the inputs moved on every call";
+        for (std::uint32_t call = 0; call < calls; ++call) {
+            auto start  = Clock::now();
+            auto inputs = move_inputs();
+            output.per_call_move.push_back(elapsed_ns(start));
+            start        = Clock::now();
+            auto results = ::tt::runtime::submit(device.device, program.binary, 0, inputs);
+            ::tt::runtime::wait(results);
+            output.per_call_submit.push_back(elapsed_ns(start));
+            start = Clock::now();
+            read_back(results);
+            output.per_call_readback.push_back(elapsed_ns(start));
+        }
+        stage       = "running with the inputs moved once";
+        auto staged = move_inputs();
+        for (std::uint32_t call = 0; call < calls; ++call) {
+            auto start   = Clock::now();
+            auto results = ::tt::runtime::submit(device.device, program.binary, 0, staged);
+            ::tt::runtime::wait(results);
+            output.staged_submit.push_back(elapsed_ns(start));
+            start = Clock::now();
+            read_back(results);
+            output.staged_readback.push_back(elapsed_ns(start));
+        }
+        output.bytes_read = read_bytes;
         complete(outcome);
     } catch (...) {
         fail_current(outcome, stage);

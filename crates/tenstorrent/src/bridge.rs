@@ -101,6 +101,24 @@ pub mod ffi
         readback_ns: u64,
     }
 
+    /// Per-call timings of a probe, each in nanoseconds.
+    #[derive(Debug, Default)]
+    struct ProbeOutput
+    {
+        /// Moving the inputs into the program's layout, on every call.
+        per_call_move: Vec<u64>,
+        /// Submission to completion, inputs moved on every call.
+        per_call_submit: Vec<u64>,
+        /// Reading the outputs back, inputs moved on every call.
+        per_call_readback: Vec<u64>,
+        /// Submission to completion, inputs moved once.
+        staged_submit: Vec<u64>,
+        /// Reading the outputs back, inputs moved once.
+        staged_readback: Vec<u64>,
+        /// Output bytes read back over every call of both modes.
+        bytes_read: u64,
+    }
+
     // SAFETY: the declarations below are sound to call from safe Rust under
     // the unsafe invariants stated in this module's `# Safety` section.
     unsafe extern "C++" {
@@ -155,6 +173,15 @@ pub mod ffi
             planes: &[u16],
             tail: &[u16],
             output: &mut RunOutput,
+            outcome: &mut Outcome,
+        );
+
+        /// Run `program` `calls` times over zero inputs, timing each stage.
+        fn probe_program(
+            device: Pin<&mut Device>,
+            program: &Program,
+            calls: u32,
+            output: &mut ProbeOutput,
             outcome: &mut Outcome,
         );
     }

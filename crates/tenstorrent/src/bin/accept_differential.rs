@@ -23,10 +23,12 @@ use infinitum_tenstorrent::DeviceAnswer;
 use infinitum_tenstorrent::HostFailure;
 use infinitum_tenstorrent::Lowering;
 use infinitum_tenstorrent::PrefixSite;
+use infinitum_tenstorrent::ProbeCalls;
 use infinitum_tenstorrent::Sample;
 use infinitum_tenstorrent::SampleCase;
 use infinitum_tenstorrent::Seed;
 use infinitum_tenstorrent::ShapeMismatch;
+use infinitum_tenstorrent::StageTimes;
 use infinitum_tenstorrent::SystemDescriptor;
 use infinitum_tenstorrent::Tenstorrent;
 use infinitum_tenstorrent::TenstorrentDevice;
@@ -145,6 +147,17 @@ enum Command
         /// Warm calls timed on one sample after the differential.
         #[arg(long, default_value = "20")]
         warm: Repeats,
+    },
+    /// Time any flatbuffer's round trip over zero inputs, stage by stage,
+    /// with its inputs moved on every call and moved once.
+    Probe
+    {
+        /// The flatbuffer, for either runtime.
+        #[arg(long)]
+        flatbuffer: std::path::PathBuf,
+        /// Round trips timed in each mode.
+        #[arg(long, default_value = "50")]
+        calls: Repeats,
     },
     /// Plan the canonical DFlash2 round with the Tenstorrent planner, lower
     /// its Accept fragment, and run a request's rounds of acceptance on the
@@ -492,6 +505,31 @@ fn round(
     return Ok(());
 }
 
+/// Write one stage's fastest, median, and slowest call.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: one line naming the stage and its summary, or that it has none.
+/// - provides: the probe report's rows.
+/// - fails: when writing fails.
+/// - panics: none.
+///
+/// # Errors
+/// - [`std::io::Error`]: writing failed.
+fn write_stage(
+    out: &mut dyn std::io::Write,
+    stage: &str,
+    times: &StageTimes,
+) -> std::io::Result<()>
+{
+    return match times.summary() {
+        | infinitum_round::Maybe::Present([least, median, most]) => {
+            writeln!(out, "{stage}: min {least} median {median} max {most}")
+        },
+        | infinitum_round::Maybe::Absent(_) => writeln!(out, "{stage}: no calls"),
+    };
+}
+
 /// Write what lowering in process cost.
 ///
 /// # Specification
@@ -576,6 +614,30 @@ fn run(command: Command) -> Result<(), HarnessFailure>
                 | (None, None) => return Err(HarnessFailure::NoProgram),
             };
             differential(&mut out, &program, drafts, seeds, warm)
+        },
+        | Command::Probe { flatbuffer, calls } => {
+            let report =
+                infinitum_tenstorrent::probe_binary(&flatbuffer, ProbeCalls::from(calls.0))?;
+            writeln!(
+                out,
+                "probe: {}, {calls} calls per mode",
+                flatbuffer.display()
+            )?;
+            write_stage(&mut out, "moved per call: move", &report.per_call_move)?;
+            write_stage(&mut out, "moved per call: submit", &report.per_call_submit)?;
+            write_stage(
+                &mut out,
+                "moved per call: readback",
+                &report.per_call_readback,
+            )?;
+            write_stage(&mut out, "moved once: submit", &report.staged_submit)?;
+            write_stage(&mut out, "moved once: readback", &report.staged_readback)?;
+            writeln!(
+                out,
+                "output bytes read over both modes: {}",
+                report.bytes_read
+            )?;
+            Ok(())
         },
         | Command::Round {
             system_desc,

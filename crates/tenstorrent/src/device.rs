@@ -3,6 +3,7 @@
 use core::num::NonZeroU32;
 
 use infinitum_round::DraftWidth;
+use infinitum_round::Maybe;
 use infinitum_round::TokenCount;
 use infinitum_round::TokenId;
 
@@ -48,6 +49,8 @@ pub enum Operation
     SystemDesc,
     /// Running the program.
     Run,
+    /// Probing a binary's round trip.
+    Probe,
 }
 
 impl core::fmt::Display for Operation
@@ -69,6 +72,7 @@ impl core::fmt::Display for Operation
             | Self::Open => "opening the device",
             | Self::SystemDesc => "writing the system descriptor",
             | Self::Run => "running the program",
+            | Self::Probe => "probing the binary",
         });
     }
 }
@@ -502,6 +506,126 @@ pub fn save_system_desc(path: &std::path::Path) -> Result<(), HostFailure>
     let mut result = outcome();
     ffi::save_system_desc(text, &mut result);
     return checked(Operation::SystemDesc, result);
+}
+
+/// One stage's per-call timings.
+#[repr(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageTimes(Vec<Nanos>);
+
+impl StageTimes
+{
+    /// Wrap the host's counts, sorted.
+    ///
+    /// # Specification
+    /// trivial.
+    fn sorted(counts: Vec<u64>) -> Self
+    {
+        let mut times: Vec<Nanos> = counts.into_iter().map(Nanos).collect();
+        times.sort_unstable();
+        return Self(times);
+    }
+
+    /// The fastest call, the median call, and the slowest call.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: [`Maybe::Present`] with the three when any call was timed.
+    /// - provides: the summary the probe report prints.
+    /// - fails: never.
+    /// - panics: none.
+    #[inline]
+    #[must_use]
+    pub fn summary(&self) -> Maybe<[Nanos; 3], NoCalls>
+    {
+        let middle = self.0.len().checked_div(2).unwrap_or_default();
+        return match (self.0.first(), self.0.get(middle), self.0.last()) {
+            | (Some(&least), Some(&median), Some(&most)) => Maybe::Present([least, median, most]),
+            | _ => Maybe::Absent(NoCalls),
+        };
+    }
+}
+
+/// Why a stage has no summary: no call was timed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoCalls;
+
+/// A binary's round trip, stage by stage, over zero inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeReport
+{
+    /// Moving the inputs into the program's layout on every call.
+    pub per_call_move: StageTimes,
+    /// Submission to completion, inputs moved on every call.
+    pub per_call_submit: StageTimes,
+    /// Reading back, inputs moved on every call.
+    pub per_call_readback: StageTimes,
+    /// Submission to completion, inputs moved once.
+    pub staged_submit: StageTimes,
+    /// Reading back, inputs moved once.
+    pub staged_readback: StageTimes,
+    /// Output bytes read back over every call of both modes.
+    pub bytes_read: u64,
+}
+
+/// Load the flatbuffer at `path`, open the device for its runtime, and time
+/// `calls` round trips over zero inputs in each input mode.
+///
+/// # Specification
+/// - requires: a device is visible and none is open in this process.
+/// - ensures: on success every stage holds `calls` timings.
+/// - provides: the dispatch floor of a binary for either runtime.
+/// - fails: when the host fails.
+/// - panics: none.
+///
+/// # Errors
+/// - [`HostFailure::Path`]: the path is not Unicode.
+/// - [`HostFailure::Host`]: the host failed.
+#[inline]
+pub fn probe_binary(
+    path: &std::path::Path,
+    calls: ProbeCalls,
+) -> Result<ProbeReport, HostFailure>
+{
+    let text = path_text(path)?;
+    let mut result = outcome();
+    let program = ffi::load_program(text, &mut result);
+    checked(Operation::Load, result)?;
+    let mut result = outcome();
+    let mut device = ffi::open_device(&program, &mut result);
+    checked(Operation::Open, result)?;
+    let mut output = ffi::ProbeOutput::default();
+    let mut result = outcome();
+    if let Some(pinned) = device.as_mut() {
+        ffi::probe_program(pinned, &program, calls.0.get(), &mut output, &mut result);
+    }
+    checked(Operation::Probe, result)?;
+    return Ok(ProbeReport {
+        per_call_move: StageTimes::sorted(output.per_call_move),
+        per_call_submit: StageTimes::sorted(output.per_call_submit),
+        per_call_readback: StageTimes::sorted(output.per_call_readback),
+        staged_submit: StageTimes::sorted(output.staged_submit),
+        staged_readback: StageTimes::sorted(output.staged_readback),
+        bytes_read: output.bytes_read,
+    });
+}
+
+/// How many round trips a probe times in each mode.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeCalls(NonZeroU32);
+
+impl From<NonZeroU32> for ProbeCalls
+{
+    /// Wrap a count.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn from(calls: NonZeroU32) -> Self
+    {
+        return Self(calls);
+    }
 }
 
 /// An open device and the buffers its calls reuse.

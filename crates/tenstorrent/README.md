@@ -40,6 +40,7 @@ accept-differential run --system-desc p150a.ttsys --drafts 15 --prefix device
 accept-differential emit-ttir --drafts 15 > accept.mlir   # for the pipeline tools
 accept-differential run --flatbuffer accept.ttm --drafts 15
 accept-differential round --system-desc p150a.ttsys --drafts 15 --budget 70
+accept-differential probe --flatbuffer any.ttb --calls 50   # any TTMetal or TTNN binary's round trip
 ```
 
 ## License

@@ -123,6 +123,28 @@ Warm submit medians at other widths: K = 1, 17.6 ms; K = 7, 19.0 ms; K = 12, 29.
 - **Runtime:** a host tensor from `createOwnedHostTensor` fails at submit with `variant is valueless`. Borrowed host tensors work.
 - **Build:** the host translation unit must build with clang and `-fno-rtti` to match tt-mlir's toolchain.
 
+## Follow-on: where a round's time goes
+
+This section draws on the static structure of the K = 15 program and on the warm timings above. It also uses round trips of two trivial binaries per runtime, run with `accept-differential probe`.
+
+| Measure | Value |
+| ------- | ----- |
+| Host-to-device writes per round | 16, totalling 24.9 MB: logits, pad plane, and local plane at 8.2 MB each, the rest under 70 KB |
+| Device programs per round | 108, with 239 kernel configurations and 203 buffer creations and deallocations |
+| Host synchronisations per round | 4 `finish` commands |
+| Warm submit against bytes written (K = 1, 7, 15) | about 17.0 ms fixed plus 0.19 ms per MB (about 5 GB/s over the card's PCIe Gen4 ×4 link) |
+| Share at K = 15 | about 4.7 ms copying, about 17 ms program-bound (about 157 µs per program) |
+| TTMetal, `ttir.add` 32×32 (4 programs) | 323–350 µs per round trip |
+| TTMetal, one max over `[16, 970, 256]` (7 programs, 10.5 MB written) | 3.37 ms, within 10% of the fit |
+| TTNN, `ttir.add` 32×32 | about 62 µs per round trip (inputs moved each call), about 41 µs with inputs resident |
+| TTNN, the same max over the logits | about 1.35 ms with the logits copied each call, about 0.18 ms with them resident |
+
+The TTMetal runtime rebuilds every `tt_metal::Program` (kernels, circular buffers, runtime arguments) on each submit, in `runtime/lib/ttmetal/executor.cpp`. It also cannot keep inputs on the device (`getLayout`/`toLayout` are marked TODO), so the constant planes cross PCIe on every round. The TTNN runtime keeps inputs resident and dispatches a cached op in about 22 µs. At this pin, `ttir.argmax` over the full `[16, 248077]` lowers through the TTNN backend pipeline to a single `ttnn.argmax`; that lowering was only compiled, not run.
+
+The split of the program-bound 17 ms into host program construction and device execution was not measured. It needs the device profiler, which this build lacks.
+
+The K-width aborts reduce to one rank-3 reduction in `d2m-grid-selection`; the standalone repro is on issue #7.
+
 ## Reproducing
 
 The `device` feature's build variables are in [`README.md`](README.md). Every device run above is one of:

@@ -24,6 +24,7 @@ struct AcceptGeometry;
 struct CompileRecord;
 struct Outcome;
 struct RunOutput;
+struct ProbeOutput;
 
 /// A lowered Accept fragment: one flatbuffer binary holding one program.
 class Program {
@@ -144,5 +145,22 @@ void save_system_desc(rust::Str path, Outcome& outcome) noexcept;
 void run_accept(Device& device, const Program& program, rust::Slice<const std::uint16_t> logits,
                 rust::Slice<const std::uint16_t> planes, rust::Slice<const std::uint16_t> tail,
                 RunOutput& output, Outcome& outcome) noexcept;
+
+/// Run `program` `calls` times on `device` over zero-filled inputs, timing each stage, twice: once
+/// moving the inputs to the device on every call, once with them moved before the first call.
+///
+/// # Specification
+/// - requires: `calls` is at least one.
+/// - ensures: on success `output` holds, per call and per mode, the nanoseconds spent moving the
+///   inputs into the program's layout, submitting and waiting, and reading every output back, and
+///   `outcome.status` is `Completed`. Under the TTMetal runtime moving an input is the identity,
+///   since that runtime copies host inputs inside the submit; under TTNN it is the host-to-device
+///   copy.
+/// - provides: the round trip of an arbitrary binary, for comparing dispatch floors.
+/// - fails: when an input's data type is unsupported or the runtime rejects a call; reported
+///   through `outcome`, never thrown.
+/// - panics: none.
+void probe_program(Device& device, const Program& program, std::uint32_t calls,
+                   ProbeOutput& output, Outcome& outcome) noexcept;
 
 } // namespace infinitum::tenstorrent
