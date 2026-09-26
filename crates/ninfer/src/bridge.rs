@@ -107,6 +107,8 @@ pub mod ffi
         device: i32,
         /// The context ceiling, which also sizes the KV cache.
         max_context: u32,
+        /// How long a request may wait for admission, in milliseconds.
+        pending_timeout_ms: u32,
         /// DFlash2's draft width `K`.
         draft_width: u32,
         /// CUDA graph capture.

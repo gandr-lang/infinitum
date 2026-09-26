@@ -21,6 +21,7 @@ pub use crate::parse::Defaults;
 pub use crate::server::Access;
 pub use crate::server::ApiKey;
 pub use crate::server::ModelId;
+pub use crate::server::RequestBytes;
 pub use crate::server::ServeConfig;
 pub use crate::server::serve;
 pub use crate::server::warm_up;

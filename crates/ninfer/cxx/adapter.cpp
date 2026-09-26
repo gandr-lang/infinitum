@@ -438,6 +438,7 @@ std::unique_ptr<Session> open_session(const EngineConfig& config, Outcome& outco
         options.device        = config.device;
         options.max_context   = config.max_context;
         options.kv_capacity   = ::ninfer::KvCapacityPolicy::explicit_capacity(config.max_context);
+        options.pending_timeout_ms        = config.pending_timeout_ms;
         options.use_cuda_graph            = config.cuda_graph == CudaGraph::On;
         options.speculative.backend       = ::ninfer::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens  = config.draft_width;

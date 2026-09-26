@@ -568,6 +568,7 @@ impl Session
             artifact: String::from(artifact),
             device: i32::from(options.device()),
             max_context: core::num::NonZeroU32::from(options.context()).get(),
+            pending_timeout_ms: core::num::NonZeroU32::from(options.pending_timeout()).get(),
             draft_width: core::num::NonZeroU32::from(plan.width()).get(),
             cuda_graph: match options.cuda_graph() {
                 | CudaGraph::Off => ffi::CudaGraph::Off,

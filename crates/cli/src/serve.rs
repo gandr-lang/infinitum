@@ -13,6 +13,7 @@ use infinitum_ninfer::CudaGraph;
 use infinitum_ninfer::DFlash2Plan;
 use infinitum_ninfer::DeviceOrdinal;
 use infinitum_ninfer::Ninfer;
+use infinitum_ninfer::PendingTimeout;
 use infinitum_round::Backend as _;
 use infinitum_round::BuildFailure;
 use infinitum_round::DraftWidth;
@@ -37,6 +38,17 @@ pub struct Server
     /// The per-request context ceiling in tokens; it also sizes the KV cache.
     #[arg(long, value_name = "TOKENS", default_value = "8192")]
     max_context: ContextLimit,
+    /// The output limit of a request that names none; the Engine also clamps
+    /// it to the context left after the prompt.
+    #[arg(long, value_name = "TOKENS", default_value = "8192")]
+    default_max_tokens: OutputTokens,
+    /// How long a request may wait for admission before it is refused.
+    #[arg(long, value_name = "MILLISECONDS", default_value = "30000")]
+    pending_timeout_ms: PendingTimeout,
+    /// The largest request body accepted, in MiB; a larger one is refused
+    /// with 413 before it is parsed.
+    #[arg(long, value_name = "MIB", default_value = "384")]
+    max_request_mib: RequestMib,
     /// The CUDA device ordinal.
     #[arg(long, value_name = "ORDINAL", default_value = "0")]
     device: DeviceOrdinal,
@@ -56,6 +68,101 @@ pub struct Server
     /// The model id clients name; absent, the artifact's model name.
     #[arg(long, value_name = "ID")]
     model_id: Option<String>,
+}
+
+/// A positive output limit in tokens.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputTokens(core::num::NonZeroU32);
+
+impl core::str::FromStr for OutputTokens
+{
+    type Err = core::num::ParseIntError;
+
+    /// Parse a positive decimal token count.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the limit is the parsed value, at least one.
+    /// - provides: `--default-max-tokens`, refusing zero as ninfer's server
+    ///   does.
+    /// - fails: with the integer parser's error on zero, a negative value,
+    ///   anything above `u32::MAX`, or a non-numeric string.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`core::num::ParseIntError`]: `text` is not a positive `u32`.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at the zero boundary.
+    /// - witness: `crate::tests::serve_limits_refuse_zero`
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        return text.parse::<core::num::NonZeroU32>().map(Self);
+    }
+}
+
+/// A request-body cap in MiB, whose byte count fits `usize`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestMib(core::num::NonZeroUsize);
+
+/// A request-body cap that is zero, not a number, or too large to count in
+/// bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestMibOutOfRange;
+
+impl core::fmt::Display for RequestMibOutOfRange
+{
+    /// Render the refusal, in ninfer's words.
+    ///
+    /// # Specification
+    /// trivial.
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result
+    {
+        return f.write_str("--max-request-mib is out of range");
+    }
+}
+
+impl core::error::Error for RequestMibOutOfRange
+{
+}
+
+impl core::str::FromStr for RequestMib
+{
+    type Err = RequestMibOutOfRange;
+
+    /// Parse a positive decimal count of MiB whose bytes fit `usize`.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the cap is the parsed MiB in bytes.
+    /// - provides: `--max-request-mib`, with ninfer's range.
+    /// - fails: on zero, a non-numeric string, or a count whose bytes overflow
+    ///   `usize`.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`RequestMibOutOfRange`]: as stated.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at zero and at the overflow boundary.
+    /// - witness: `crate::tests::serve_limits_refuse_zero`
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        let mib = text
+            .parse::<core::num::NonZeroUsize>()
+            .map_err(|_malformed| return RequestMibOutOfRange)?;
+        return mib
+            .get()
+            .checked_mul(1 << 20)
+            .and_then(core::num::NonZeroUsize::new)
+            .map(Self)
+            .ok_or(RequestMibOutOfRange);
+    }
 }
 
 /// A failure of `serve`.
@@ -237,7 +344,8 @@ where
         server.max_context,
         server.cuda_graph,
     )
-    .with_chat_template(template);
+    .with_chat_template(template)
+    .with_pending_timeout(server.pending_timeout_ms);
     let engine =
         infinitum_ninfer::ChatEngine::open(&options, plan).map_err(ServeFailure::Engine)?;
     infinitum_serve::warm_up(&engine).map_err(ServeFailure::WarmUp)?;
@@ -258,8 +366,9 @@ where
             server.max_context,
         )),
         defaults: infinitum_serve::Defaults {
-            output_tokens: infinitum_round::TokenCount::from(8192_u32),
+            output_tokens: infinitum_round::TokenCount::from(server.default_max_tokens.0),
         },
+        max_request: infinitum_serve::RequestBytes(server.max_request_mib.0),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_io()

@@ -25,6 +25,7 @@ pub use options::ContextLimit;
 pub use options::CudaGraph;
 pub use options::DeviceOrdinal;
 pub use options::EngineOptions;
+pub use options::PendingTimeout;
 pub use options::UnknownCudaGraph;
 pub use plan::DFlash2Plan;
 pub use plan::Ninfer;

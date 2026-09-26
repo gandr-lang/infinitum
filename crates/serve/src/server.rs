@@ -46,8 +46,19 @@ use crate::render::error_event;
 use crate::render::fresh_bits;
 use crate::render::unix_now;
 
-/// The largest request body accepted, ninfer's default.
-const MAXIMUM_REQUEST_BYTES: usize = 384 << 20;
+/// The largest request body accepted.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBytes(pub core::num::NonZeroUsize);
+
+impl RequestBytes
+{
+    /// ninfer's default: 384 MiB.
+    pub const DEFAULT: Self = Self(match core::num::NonZeroUsize::new(384_usize << 20_u32) {
+        | Some(bytes) => bytes,
+        | None => core::num::NonZeroUsize::MIN,
+    });
+}
 
 /// How long a stream may go without an event before a keep-alive comment.
 const HEARTBEAT: core::time::Duration = core::time::Duration::from_secs(5);
@@ -131,6 +142,8 @@ pub struct ServeConfig
     pub max_model_len: TokenCount,
     /// Request defaults.
     pub defaults: Defaults,
+    /// The largest request body accepted.
+    pub max_request: RequestBytes,
 }
 
 /// What every handler shares.
@@ -666,17 +679,40 @@ async fn streamed(
 ///
 /// # Specification
 /// - requires: nothing.
-/// - ensures: a body that is not JSON is 400; a refused body is its translation
-///   error; another model id is 404 `model_not_found`; otherwise the request
-///   runs aggregate or streamed as it asks.
+/// - ensures: a body over the configured cap is 413 `request_too_large` with
+///   ninfer's message; a body that is not JSON is 400; a refused body is its
+///   translation error; another model id is 404 `model_not_found`; otherwise
+///   the request runs aggregate or streamed as it asks.
 /// - provides: chat completions.
 /// - fails: never; failures are responses.
 /// - panics: none.
 async fn chat(
     State(shared): State<Arc<Shared>>,
-    body: Bytes,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response
 {
+    let body = match body {
+        | Ok(body) => body,
+        | Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return error_response(&ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                kind: "invalid_request_error",
+                message: format!(
+                    "request body exceeds the configured payload limit of {} bytes",
+                    shared.config.max_request.0
+                ),
+                param: String::new(),
+                code: String::from("request_too_large"),
+            });
+        },
+        | Err(rejection) => {
+            return error_response(&ApiError::invalid(
+                rejection.body_text(),
+                Param::NONE,
+                Code::NONE,
+            ));
+        },
+    };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
     else {
         return error_response(&ApiError::invalid(
@@ -761,7 +797,7 @@ pub fn warm_up(backend: &dyn ChatBackend) -> Result<(), infinitum_chat::ChatFail
 /// # Specification
 /// - requires: called within a multi-threaded tokio runtime with timers.
 /// - ensures: the four routes answer as their handlers specify, behind the
-///   gate, with request bodies capped at ninfer's default 384 MiB.
+///   gate, with request bodies capped at the configured size.
 /// - provides: `infinitum serve`'s server.
 /// - fails: when accepting fails.
 /// - panics: none.
@@ -793,6 +829,7 @@ fn router(
     config: ServeConfig,
 ) -> axum::Router
 {
+    let limit = config.max_request.0.get();
     let shared = Arc::new(Shared { backend, config });
     return axum::Router::new()
         .route("/health", axum::routing::get(health))
@@ -803,7 +840,7 @@ fn router(
             Arc::clone(&shared),
             gate,
         ))
-        .layer(axum::extract::DefaultBodyLimit::max(MAXIMUM_REQUEST_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(limit))
         .with_state(shared);
 }
 
@@ -838,6 +875,7 @@ mod tests
     use super::Access;
     use super::ApiKey;
     use super::ModelId;
+    use super::RequestBytes;
     use super::ServeConfig;
     use super::Verdict;
     use super::bearer_matches;
@@ -933,6 +971,7 @@ mod tests
                 defaults: Defaults {
                     output_tokens: TokenCount::from(8_u32),
                 },
+                max_request: RequestBytes(core::num::NonZeroUsize::new(1024).unwrap()),
             },
         );
     }
@@ -1152,6 +1191,22 @@ mod tests
             status,
             StatusCode::BAD_REQUEST,
             "a body that is not JSON is refused"
+        );
+        let (status, body) = send(chat(Body::from(" ".repeat(1024)))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a body at the cap is read: {body}"
+        );
+        let (status, body) = send(chat(Body::from(" ".repeat(1025)))).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a body past the cap is refused"
+        );
+        assert!(
+            body.contains(r#""code":"request_too_large""#) && body.contains("limit of 1024 bytes"),
+            "the refusal is ninfer's: {body}"
         );
     }
 }
