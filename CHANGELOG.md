@@ -13,6 +13,7 @@ All notable changes to infinitum are documented here.
 - _(engine)_ Size and store serve's KV cache (#11)
 - _(engine)_ Run serve's requests on concurrent Engine lanes (#12)
 - _(engine)_ Reuse served prompt state across requests (#13)
+- _(engine)_ Scale RoPE positions for served long context (#14)
 
 ### Unreleased Bug Fixes
 
