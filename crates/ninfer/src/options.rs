@@ -1,6 +1,6 @@
 //! How an Engine is opened: the artifact, the device, the context ceiling,
-//! the KV cache's capacity and storage, the prefill chunk, the pending
-//! timeout, CUDA graph capture, and the chat template.
+//! the KV cache's capacity and storage, the prefill chunk, the concurrency,
+//! the pending timeout, CUDA graph capture, and the chat template.
 
 /// The logical ceiling of one request in tokens, prompt and generation
 /// together. The Engine also sizes its KV cache from it, so a small ceiling
@@ -306,6 +306,88 @@ impl core::error::Error for MalformedPrefillChunk
 {
 }
 
+/// How many requests the Engine runs at once, each on its own lane: one to
+/// eight, ninfer's range.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Concurrency(core::num::NonZeroU32);
+
+impl Concurrency
+{
+    /// One request at a time, ninfer's default.
+    pub const ONE: Self = Self(core::num::NonZeroU32::MIN);
+}
+
+impl From<Concurrency> for core::num::NonZeroU32
+{
+    /// Unwrap the lane count.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn from(concurrency: Concurrency) -> Self
+    {
+        return concurrency.0;
+    }
+}
+
+impl core::str::FromStr for Concurrency
+{
+    type Err = ConcurrencyOutOfRange;
+
+    /// Parse a decimal lane count from one to eight.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the concurrency is the parsed value, in `[1,8]`.
+    /// - provides: the command-line spelling of a concurrency, with ninfer's
+    ///   range.
+    /// - fails: on zero, anything above eight, or a non-numeric string.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`ConcurrencyOutOfRange`]: as stated.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 either side of both ends of the range.
+    /// - witness: `tests::concurrency_is_one_to_eight`
+    #[inline]
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        let lanes = text
+            .parse::<core::num::NonZeroU32>()
+            .map_err(|_malformed| return ConcurrencyOutOfRange)?;
+        if lanes.get() > 8 {
+            return Err(ConcurrencyOutOfRange);
+        }
+        return Ok(Self(lanes));
+    }
+}
+
+/// A concurrency outside one to eight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConcurrencyOutOfRange;
+
+impl core::fmt::Display for ConcurrencyOutOfRange
+{
+    /// Render the failure, in ninfer's words.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result
+    {
+        return f.write_str("--max-concurrency must be in [1,8]");
+    }
+}
+
+impl core::error::Error for ConcurrencyOutOfRange
+{
+}
+
 /// How long a request may wait for admission, in milliseconds; past it the
 /// Engine refuses the request with a queue timeout.
 #[repr(transparent)]
@@ -500,6 +582,8 @@ pub struct EngineOptions
     kv_storage: KvStorage,
     /// The prefill chunk.
     prefill_chunk: PrefillChunk,
+    /// The concurrency.
+    concurrency: Concurrency,
     /// The pending timeout.
     pending_timeout: PendingTimeout,
     /// CUDA graph capture.
@@ -531,6 +615,7 @@ impl EngineOptions
             kv_capacity: KvCapacity::Tokens(context.0),
             kv_storage: KvStorage::BFloat16,
             prefill_chunk: PrefillChunk::DEFAULT,
+            concurrency: Concurrency::ONE,
             pending_timeout: PendingTimeout::DEFAULT,
             cuda_graph,
             chat_template: ChatTemplate::Artifact,
@@ -667,6 +752,34 @@ impl EngineOptions
         return self.prefill_chunk;
     }
 
+    /// The same options with `concurrency` requests running at once.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub fn with_concurrency(
+        self,
+        concurrency: Concurrency,
+    ) -> Self
+    {
+        return Self {
+            concurrency,
+            ..self
+        };
+    }
+
+    /// The concurrency; one unless set.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn concurrency(&self) -> Concurrency
+    {
+        return self.concurrency;
+    }
+
     /// The same options with `template` rendering chat prompts.
     ///
     /// # Specification
@@ -746,6 +859,8 @@ mod tests
 {
     use core::str::FromStr as _;
 
+    use super::Concurrency;
+    use super::ConcurrencyOutOfRange;
     use super::ContextLimit;
     use super::CudaGraph;
     use super::DeviceOrdinal;
@@ -884,6 +999,24 @@ mod tests
                 "{text} is not a chunk"
             );
         }
+    }
+
+    /// One and eight are concurrencies; zero and nine are not.
+    #[test]
+    fn concurrency_is_one_to_eight()
+    {
+        assert_eq!(Concurrency::from_str("1"), Ok(Concurrency::ONE), "one lane");
+        assert!(Concurrency::from_str("8").is_ok(), "eight lanes");
+        assert_eq!(
+            Concurrency::from_str("0"),
+            Err(ConcurrencyOutOfRange),
+            "no lane"
+        );
+        assert_eq!(
+            Concurrency::from_str("9"),
+            Err(ConcurrencyOutOfRange),
+            "past ninfer's range"
+        );
     }
 
     /// Minus one names no device; zero does.

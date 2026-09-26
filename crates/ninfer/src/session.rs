@@ -586,6 +586,7 @@ impl Session
                 | KvStorage::Fp8KeyNvfp4Value => ffi::KvStorage::Fp8KeyNvfp4Value,
             },
             prefill_chunk: core::num::NonZeroU32::from(options.prefill_chunk()).get(),
+            max_concurrency: core::num::NonZeroU32::from(options.concurrency()).get(),
             pending_timeout_ms: core::num::NonZeroU32::from(options.pending_timeout()).get(),
             draft_width: core::num::NonZeroU32::from(plan.width()).get(),
             cuda_graph: match options.cuda_graph() {

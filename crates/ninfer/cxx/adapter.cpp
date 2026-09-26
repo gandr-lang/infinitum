@@ -456,6 +456,7 @@ std::unique_ptr<Session> open_session(const EngineConfig& config, Outcome& outco
                                     : ::ninfer::KvCapacityPolicy::explicit_capacity(config.kv_capacity);
         options.kv_cache      = to_storage(config.kv_storage);
         options.prefill_chunk = config.prefill_chunk;
+        options.max_concurrency = config.max_concurrency;
         options.pending_timeout_ms        = config.pending_timeout_ms;
         options.use_cuda_graph            = config.cuda_graph == CudaGraph::On;
         options.speculative.backend       = ::ninfer::SpeculativeBackend::DFlash2;
