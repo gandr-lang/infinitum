@@ -23,11 +23,21 @@ fn main() -> Result<(), std::env::VarError>
 {
     let include = std::env::var("INFINITUM_NINFER_INCLUDE")?;
     let lib = std::env::var("INFINITUM_NINFER_LIB")?;
+    // The generated translation unit is compiled apart from the adapter so
+    // one diagnostic can be scoped to it: GCC's `-Wmaybe-uninitialized`
+    // misfires on the `rust::Vec<T>` default constructor `cxx` generates for
+    // each shared struct, which hands the not-yet-constructed `this` to a
+    // const-pointer shim. The adapter keeps every warning.
     cxx_build::bridge("src/bridge.rs")
+        .include(&include)
+        .std("c++26")
+        .flag_if_supported("-Wno-maybe-uninitialized")
+        .compile("infinitum-ninfer-bridge");
+    cxx_build::bridges(core::iter::empty::<&str>())
         .file("cxx/adapter.cpp")
         .include(&include)
         .std("c++26")
-        .compile("infinitum-ninfer-bridge");
+        .compile("infinitum-ninfer-adapter");
     println!("cargo::rerun-if-changed=src/bridge.rs");
     println!("cargo::rerun-if-changed=cxx/adapter.cpp");
     println!("cargo::rerun-if-changed=cxx/adapter.h");

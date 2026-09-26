@@ -7,6 +7,7 @@
     clippy::multiple_unsafe_ops_per_block,
     clippy::renamed_function_params,
     clippy::semicolon_outside_block,
+    clippy::too_many_arguments,
     reason = "the lints fire on the code `cxx::bridge` generates, which this crate does not write"
 )]
 
@@ -21,11 +22,16 @@
 ///   through the generated header; every function declared below is `noexcept`,
 ///   and every internal helper that can throw is called only inside a catch-all
 ///   in one of them, so no exception crosses into Rust (an escaping one would
-///   terminate the process, never unwind); `generate` touches the `ReviewSink`
-///   only through a controller whose pointer to it is cleared under a mutex
-///   before `generate` returns, so the Engine never reaches the sink after its
-///   borrow ends; `Session` is used only through the `UniquePtr` `open_session`
-///   returns, and only when that pointer is non-null.
+///   terminate the process, never unwind); `generate` and `run_chat` touch the
+///   `ReviewSink` only through a controller whose pointer to it is cleared
+///   under a mutex before they return, so the Engine never reaches the sink
+///   after its borrow ends; `run_chat` reaches the `ChatSink` only from the
+///   thread that called it, through an output sink that lives on its stack and
+///   is gone when it returns, and reaches the `CancelFlag`, an atomic flag
+///   readable from any thread, only through cancellation views that end with
+///   the calls they are passed to; `Session` is used only through the
+///   `UniquePtr` `open_session` returns, and only when that pointer is
+///   non-null.
 #[cxx::bridge(namespace = "infinitum::ninfer")]
 pub mod ffi
 {
@@ -41,6 +47,31 @@ pub mod ffi
         Runtime,
         /// ninfer threw something that is not a `std::exception`.
         Unknown,
+        /// ninfer refused the request with a classified `RequestError`.
+        Refused,
+    }
+
+    /// Why ninfer refused a request, when [`Status::Refused`].
+    #[derive(Debug)]
+    enum Refusal
+    {
+        /// Not refused.
+        None,
+        /// The prompt exceeds the context ceiling.
+        ContextLength,
+        /// The thinking budget leaves no room for its closing control
+        /// tokens.
+        ThinkingBudgetCapacity,
+        /// Media exceeded its budget or was invalid.
+        Media,
+        /// The queue is full.
+        Overloaded,
+        /// The request expired while pending.
+        QueueTimeout,
+        /// The request was cancelled before admission.
+        Cancelled,
+        /// The Engine is not serving.
+        Unavailable,
     }
 
     /// An adapter call's status and, on failure, ninfer's message.
@@ -49,6 +80,8 @@ pub mod ffi
     {
         /// How the call ended.
         status: Status,
+        /// The refusal's class under [`Status::Refused`]; `None` otherwise.
+        refusal: Refusal,
         /// ninfer's message, empty on success.
         message: String,
     }
@@ -78,6 +111,9 @@ pub mod ffi
         draft_width: u32,
         /// CUDA graph capture.
         cuda_graph: CudaGraph,
+        /// A chat template overriding the artifact's; empty keeps the
+        /// artifact's own.
+        chat_template: String,
     }
 
     /// Why a generation ended, as ninfer reports it.
@@ -151,9 +187,224 @@ pub mod ffi
         limit: u32,
     }
 
+    /// Who wrote a turn.
+    #[derive(Debug)]
+    enum ChatRole
+    {
+        /// A system instruction.
+        System,
+        /// A developer instruction.
+        Developer,
+        /// The user.
+        User,
+        /// The model.
+        Assistant,
+        /// A tool's result.
+        Tool,
+    }
+
+    /// One tool call of an assistant turn.
+    #[derive(Debug)]
+    struct ChatToolCall
+    {
+        /// The call's wire identity.
+        id: String,
+        /// The function's name.
+        name: String,
+        /// The arguments' JSON text.
+        arguments: String,
+    }
+
+    /// One turn.
+    #[derive(Debug)]
+    struct ChatTurn
+    {
+        /// Who wrote it.
+        role: ChatRole,
+        /// Its text parts, in order.
+        parts: Vec<String>,
+        /// Carried reasoning.
+        reasoning: String,
+        /// An assistant turn's calls.
+        tool_calls: Vec<ChatToolCall>,
+        /// The call a tool turn answers.
+        tool_call_id: String,
+    }
+
+    /// A chat-template switch.
+    #[derive(Debug)]
+    enum TemplateSwitch
+    {
+        /// Left to the template.
+        Unset,
+        /// On.
+        On,
+        /// Off.
+        Off,
+    }
+
+    /// A requested reasoning effort.
+    #[derive(Debug)]
+    enum EffortLevel
+    {
+        /// None requested.
+        Unset,
+        /// No reasoning.
+        None,
+        /// Minimal.
+        Minimal,
+        /// Low.
+        Low,
+        /// Medium.
+        Medium,
+        /// High.
+        High,
+        /// Extra high.
+        XHigh,
+        /// Maximum.
+        Max,
+    }
+
+    /// What the prompt renders from.
+    #[derive(Debug)]
+    struct ChatPrompt
+    {
+        /// The conversation.
+        turns: Vec<ChatTurn>,
+        /// Tool definitions as JSON object text.
+        tools: Vec<String>,
+        /// Extra template arguments as JSON object text; empty for none.
+        template_arguments: String,
+        /// Thinking on the new turn.
+        thinking: TemplateSwitch,
+        /// Whether closed turns keep their reasoning.
+        preserve_thinking: TemplateSwitch,
+        /// The requested effort.
+        effort: EffortLevel,
+    }
+
+    /// Sampling overrides for one phase; each value applies only when its
+    /// flag is set.
+    #[derive(Debug)]
+    struct SamplingFields
+    {
+        /// Temperature.
+        temperature: f32,
+        /// Whether `temperature` is set.
+        temperature_set: bool,
+        /// Top-k.
+        top_k: i32,
+        /// Whether `top_k` is set.
+        top_k_set: bool,
+        /// Top-p.
+        top_p: f32,
+        /// Whether `top_p` is set.
+        top_p_set: bool,
+        /// Min-p.
+        min_p: f32,
+        /// Whether `min_p` is set.
+        min_p_set: bool,
+        /// Presence penalty.
+        presence_penalty: f32,
+        /// Whether `presence_penalty` is set.
+        presence_penalty_set: bool,
+        /// Frequency penalty.
+        frequency_penalty: f32,
+        /// Whether `frequency_penalty` is set.
+        frequency_penalty_set: bool,
+    }
+
+    /// How to generate.
+    #[derive(Debug)]
+    struct ChatSettings
+    {
+        /// The output limit.
+        output_tokens: u32,
+        /// Initial-phase overrides.
+        sampling: SamplingFields,
+        /// Initial-phase seed.
+        seed: u64,
+        /// Post-thinking overrides.
+        post_thinking: SamplingFields,
+        /// Post-thinking seed, when `post_thinking_seed_set`.
+        post_thinking_seed: u64,
+        /// Whether the post-thinking seed is its own rather than inherited.
+        post_thinking_seed_set: bool,
+        /// The thinking budget; zero is unlimited.
+        thinking_budget: u32,
+        /// Stop strings.
+        stops: Vec<String>,
+        /// Whether stop strings also end reasoning.
+        stops_end_reasoning: bool,
+        /// Whether special tokens survive into the output.
+        preserve_special_tokens: bool,
+        /// The longest function name tool-call parsing accepts.
+        tool_name_limit: u32,
+        /// Whether the prefix cache is read and written.
+        prefix_reuse: bool,
+        /// Whether deltas are published as they commit.
+        streaming: bool,
+    }
+
+    /// One generated tool call.
+    #[derive(Debug)]
+    struct ChatGeneratedCall
+    {
+        /// The function's name.
+        name: String,
+        /// The arguments' JSON text.
+        arguments: String,
+    }
+
+    /// What one chat request produced.
+    #[derive(Debug)]
+    struct ChatRecord
+    {
+        /// The answer.
+        content: String,
+        /// The thinking.
+        reasoning: String,
+        /// Parsed tool calls.
+        tool_calls: Vec<ChatGeneratedCall>,
+        /// Why it ended.
+        finish: Finish,
+        /// Prompt tokens.
+        prompt_tokens: u32,
+        /// Prompt tokens reused from a cached prefix.
+        reused_tokens: u32,
+        /// Every generated id.
+        generated: Vec<i32>,
+        /// Generated tokens in thinking.
+        reasoning_tokens: u32,
+        /// Admission to first output token, in nanoseconds.
+        prompt_wall_ns: u64,
+        /// First to last output token, in nanoseconds.
+        generation_wall_ns: u64,
+        /// Tokens drafted.
+        drafted: u64,
+        /// Drafted tokens accepted.
+        accepted: u64,
+    }
+
+    /// The channel a published delta belongs to.
+    #[derive(Debug)]
+    enum DeltaChannel
+    {
+        /// The answer.
+        Content,
+        /// Thinking.
+        Reasoning,
+    }
+
     extern "Rust" {
         /// The Rust side of a round review.
         type ReviewSink;
+
+        /// The Rust side of a chat request's streamed output.
+        type ChatSink<'events>;
+
+        /// A chat request's cancellation flag.
+        type CancelFlag;
 
         /// Review one round before its commit.
         fn review_round(
@@ -161,6 +412,26 @@ pub mod ffi
             licensed: &[i32],
             kind: RoundKind,
         ) -> ReviewAnswer;
+
+        /// The request passed preparation and was submitted.
+        fn chat_submitted(sink: &mut ChatSink<'_>);
+
+        /// The request was admitted.
+        fn chat_admitted(
+            sink: &mut ChatSink<'_>,
+            prompt_tokens: u32,
+            reused_tokens: u32,
+        );
+
+        /// Committed text on one channel, as bytes the Rust side validates.
+        fn chat_publish(
+            sink: &mut ChatSink<'_>,
+            channel: DeltaChannel,
+            text: &[u8],
+        );
+
+        /// Whether the consumer asked to stop.
+        fn chat_cancelled(flag: &CancelFlag) -> bool;
     }
 
     // SAFETY: the declarations below are sound to call from safe Rust under
@@ -203,8 +474,53 @@ pub mod ffi
             bytes: &mut Vec<u8>,
             outcome: &mut Outcome,
         );
+
+        /// The model name the artifact records.
+        fn model_name(
+            session: &Session,
+            name: &mut String,
+            outcome: &mut Outcome,
+        );
+
+        /// Run one chat request, publishing to `sink` when streaming, polling
+        /// `cancel`, and reviewing each round through `review`.
+        fn run_chat(
+            session: &Session,
+            prompt: &ChatPrompt,
+            settings: &ChatSettings,
+            sink: &mut ChatSink<'_>,
+            cancel: &CancelFlag,
+            review: &mut ReviewSink,
+            record: &mut ChatRecord,
+            outcome: &mut Outcome,
+        );
     }
 }
 
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the one field is `cxx`'s opaque marker, which is `!Send` only because `cxx` cannot see the C++ type; the Engine behind it is thread-safe, as the safety comment below states"
+)]
+// SAFETY: the adapter's `Session` holds one ninfer Engine and nothing else, and
+// the Engine synchronizes every public operation internally: its request queue
+// admits concurrent `prepare` and `submit` calls and its worker thread owns the
+// device state, which is how ninfer's own server shares one Engine across its
+// request threads. Moving it to another thread moves only that owner.
+unsafe impl Send for ffi::Session
+{
+}
+
+// SAFETY: as for `Send`; the functions that take `&Session` call only Engine
+// operations that ninfer's server calls concurrently from request threads.
+unsafe impl Sync for ffi::Session
+{
+}
+
+pub use crate::chat::CancelFlag;
+pub use crate::chat::ChatSink;
+pub use crate::chat::chat_admitted;
+pub use crate::chat::chat_cancelled;
+pub use crate::chat::chat_publish;
+pub use crate::chat::chat_submitted;
 pub use crate::session::ReviewSink;
 pub use crate::session::review_round;

@@ -16,6 +16,22 @@ rust-version = "1.97"
 repository = "https://github.com/silvanshade-org/infinitum"
 license = "Apache-2.0 WITH LLVM-exception"
 
+# The HTTP surface of `infinitum serve`: routing, request bodies, and chunked
+# server-sent events over hyper. The ecosystem standard for a tokio server.
+# Defaults stay off: `http1` and `tokio` are the working minimum for
+# `axum::serve` over a TCP listener; `http2` is unused by the served clients
+# and would add `h2`; `json`, `form`, `query` and `matched-path` are unused,
+# because request bodies are parsed as ordered JSON values and responses are
+# rendered as text. Alternatives: `hyper` directly, which reimplements
+# routing; `tiny_http`, which has had no release since 2022. Reversal: a
+# high-risk advisory, or a surface that needs HTTP/2.
+# consumers:
+# - infinitum-serve
+[workspace.dependencies.axum]
+version = "0.8.9"
+default-features = false
+features = ["http1", "tokio"]
+
 # Command-line argument parser; the driver takes the `derive` face.
 # The feature list is the working minimum for a derive-built CLI: `std` for the
 # hosted build, `derive` for the `Parser` macro, and `help`/`usage`/
@@ -52,6 +68,14 @@ features = ["std"]
 version = "1.0.202"
 default-features = false
 
+# The protocol-neutral chat request and the serving-backend contract.
+# consumers:
+# - infinitum
+# - infinitum-ninfer
+# - infinitum-serve
+[workspace.dependencies.infinitum-chat]
+path = "crates/chat"
+
 # The ninfer backend: DFlash2 planning, and the Engine behind `engine`.
 # consumers:
 # - infinitum (feature `ninfer`)
@@ -61,9 +85,16 @@ path = "crates/ninfer"
 # The speculative round as a graph of fragments.
 # consumers:
 # - infinitum
+# - infinitum-chat
 # - infinitum-ninfer
 [workspace.dependencies.infinitum-round]
 path = "crates/round"
+
+# The OpenAI-compatible HTTP surface.
+# consumers:
+# - infinitum
+[workspace.dependencies.infinitum-serve]
+path = "crates/serve"
 
 # The specification attribute: `#[quenchant::spec(...)]` states an obligation
 # beside the code it constrains. The release is a pre-release, so the
@@ -74,6 +105,47 @@ path = "crates/round"
 # - infinitum
 [workspace.dependencies.quenchant]
 version = "=0.0.0-rc.0"
+
+# Request bodies as JSON values. `preserve_order` keeps object keys in their
+# wire order, because tool definitions and chat-template arguments are
+# re-serialized into the prompt and their key order reaches the model.
+# consumers:
+# - infinitum-serve
+[workspace.dependencies.serde_json]
+version = "1.0.151"
+default-features = false
+features = ["preserve_order", "std"]
+
+# The async runtime under `axum`, and the channels a blocking generation
+# streams through. `rt-multi-thread` runs the server, `net` binds the
+# listener, `sync` carries deltas and the stream's start to the response,
+# `time` paces the stream's keep-alive comments; signals and file I/O are
+# unused. The serve crate's tests add `macros` for `#[tokio::test]`.
+# consumers:
+# - infinitum (feature `ninfer`)
+# - infinitum-serve
+[workspace.dependencies.tokio]
+version = "1.53.1"
+default-features = false
+features = ["net", "rt-multi-thread", "sync", "time"]
+
+# The `Stream` trait a streamed response's body implements. No feature is
+# needed for the trait; the default `time` is unused.
+# consumers:
+# - infinitum-serve
+[workspace.dependencies.tokio-stream]
+version = "0.1.19"
+default-features = false
+
+# Drives the router in tests without a socket: `ServiceExt::oneshot` from
+# `util`. `axum` already depends on it with that feature, so the test build
+# adds nothing to the graph.
+# consumers:
+# - infinitum-serve (tests)
+[workspace.dependencies.tower]
+version = "0.5.3"
+default-features = false
+features = ["util"]
 
 [workspace.lints.clippy]
 # all = { correctness, suspicious, style, complexity, perf }

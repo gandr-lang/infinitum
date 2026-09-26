@@ -18,6 +18,7 @@ publish = false
 
 [dependencies]
 cxx = { workspace = true, optional = true }
+infinitum-chat = { workspace = true, optional = true }
 infinitum-round.workspace = true
 
 [build-dependencies]
@@ -27,7 +28,7 @@ cxx-build = { workspace = true, optional = true }
 # Build the bridge and link ninfer's shared Engine library. The build reads
 # `INFINITUM_NINFER_INCLUDE` (ninfer's public headers) and
 # `INFINITUM_NINFER_LIB` (the directory holding `libninfer_engine.so`).
-engine = ["dep:cxx", "dep:cxx-build"]
+engine = ["dep:cxx", "dep:cxx-build", "dep:infinitum-chat"]
 
 [lints]
 workspace = true

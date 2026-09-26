@@ -1,0 +1,29 @@
+# The OpenAI-compatible HTTP surface of the infinitum engine: request
+# translation into the protocol-neutral chat request, response and
+# server-sent-event rendering, bearer authentication, and the server that runs
+# a chat backend behind them.
+[package]
+name = "infinitum-serve"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "The OpenAI-compatible HTTP surface of the infinitum engine"
+readme = "README.md"
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+infinitum-chat.workspace = true
+infinitum-round.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+tower.workspace = true
+
+[lints]
+workspace = true

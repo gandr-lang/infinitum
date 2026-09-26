@@ -10,7 +10,9 @@ The ninfer backend of the [infinitum](https://github.com/silvanshade-org/infinit
 
 The `engine` feature adds `Session`, which opens ninfer's C++ Engine through a `cxx` bridge, runs the plan, and hands the Engine a round controller that forwards every round's licensed tokens to an `infinitum_round::Preview` before the commit. infinitum makes the output decision; ninfer applies it and commits.
 
-The C++ side is `cxx/adapter.{h,cpp}`, compiled as C++26. Every function it defines is `noexcept`: ninfer reports failure by exception, and an exception crossing into Rust is undefined behaviour, so each call into ninfer is caught at the call site and returned as a status and message.
+`ChatEngine` serves chat requests on the same Engine as an `infinitum_chat::ChatBackend`. ninfer's frontend renders the chat template (the artifact's, or a file chosen with `ChatTemplate::File`), parses reasoning and tool calls, and runs admission and the prefix cache; the adapter forwards the submission, the admission record and every committed delta to the consumer, polls the consumer's cancellation, and returns the outcome with ninfer's token accounting, phase times and speculative tallies. A refusal keeps ninfer's class — invalid prompt, context length, thinking-budget capacity, queue full, queue timeout, cancelled, unavailable — so the HTTP surface can answer as ninfer's server does.
+
+The C++ side is `cxx/adapter.{h,cpp}`, compiled as C++26. Every function it defines is `noexcept`: ninfer reports failure by exception, and an exception crossing into Rust is undefined behaviour, so each call into ninfer is caught at the call site and returned as a status and message. The generated bridge is compiled apart from the adapter, so the one GCC diagnostic that misfires on `cxx`'s generated `rust::Vec` constructors is silenced for that translation unit alone.
 
 Building with `engine` needs ninfer's public headers and its shared Engine library (`libninfer_engine.so`, built with `NINFER_ENGINE_SHARED=ON`):
 
