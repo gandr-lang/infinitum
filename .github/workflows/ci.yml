@@ -165,7 +165,7 @@ jobs:
     steps:
       - id: resolve
         name: resolve the image reference
-        run: echo "ref=${INFINITUM_CI_IMAGE:+ghcr.io/gandr-lang/infinitum-ci:${INFINITUM_CI_IMAGE}}" >> "$GITHUB_OUTPUT"
+        run: echo "ref=${INFINITUM_CI_IMAGE:+ghcr.io/silvanshade-org/infinitum-ci:${INFINITUM_CI_IMAGE}}" >> "$GITHUB_OUTPUT"
 
   # `push` is in the condition, not just `merge_group`, because the push-to-main
   # run is the cache warmer: caches are readable only from the current branch,

@@ -81,7 +81,7 @@ jobs:
           # BuildKit mounts this only while mise verifies release attestations.
           secrets: |
             github_token=${{ secrets.GITHUB_TOKEN }}
-          outputs: type=image,name=ghcr.io/gandr-lang/infinitum-ci,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/silvanshade-org/infinitum-ci,push-by-digest=true,name-canonical=true,push=true
       - name: create the digest directory
         run: mkdir -p /tmp/digests
       - name: export the digest
@@ -124,9 +124,9 @@ jobs:
         # Word splitting intentionally supplies one reference per digest.
         run: >-
           docker buildx imagetools create
-          --tag "ghcr.io/gandr-lang/infinitum-ci:${TAG}"
-          --tag ghcr.io/gandr-lang/infinitum-ci:latest
-          $(printf 'ghcr.io/gandr-lang/infinitum-ci@sha256:%s ' *)
+          --tag "ghcr.io/silvanshade-org/infinitum-ci:${TAG}"
+          --tag ghcr.io/silvanshade-org/infinitum-ci:latest
+          $(printf 'ghcr.io/silvanshade-org/infinitum-ci@sha256:%s ' *)
       - name: inspect the published image
         env: *image-tag
-        run: docker buildx imagetools inspect "ghcr.io/gandr-lang/infinitum-ci:${TAG}"
+        run: docker buildx imagetools inspect "ghcr.io/silvanshade-org/infinitum-ci:${TAG}"
