@@ -81,6 +81,96 @@ pub enum Effort
     Max,
 }
 
+/// Where a prompt-cache marker sits in the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CacheBoundary
+{
+    /// After this many bytes of the leading system or developer message's
+    /// text.
+    LeadingInstruction(InstructionBytes),
+    /// After this many parts of the message at this one-based position.
+    MessagePart
+    {
+        /// The message's one-based position.
+        message: Count,
+        /// The parts before the boundary.
+        parts: Count,
+    },
+    /// After this many messages.
+    Message(Count),
+    /// After this many tool definitions.
+    Tool(Count),
+}
+
+/// A byte count within the leading instruction.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InstructionBytes(pub u32);
+
+/// A count of messages, parts or tools; a count of messages also names the
+/// last one's one-based position.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Count(pub u32);
+
+/// Whether a client marked a boundary explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Marked
+{
+    /// No explicit breakpoint.
+    Unmarked,
+    /// An explicit breakpoint.
+    Explicit,
+}
+
+/// Whether a boundary is the request's automatic cache write, and on whose
+/// word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Automatic
+{
+    /// Not the automatic write.
+    Not,
+    /// The protocol's default automatic write.
+    Default,
+    /// An automatic write the client asked for.
+    Requested,
+}
+
+/// A boundary at which the backend may publish the prompt prefix for reuse
+/// by later requests, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CacheMarker
+{
+    /// Where it sits.
+    pub boundary: CacheBoundary,
+    /// Whether the client marked it.
+    pub marked: Marked,
+    /// Whether it is the automatic write.
+    pub automatic: Automatic,
+}
+
+/// Whether the backend may also choose shared prefixes from the prompt's
+/// structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StructuralPrefixes
+{
+    /// It may.
+    Allowed,
+    /// Only the markers name shared prefixes, as a protocol with its own
+    /// write policy requires.
+    Withheld,
+}
+
+/// The prompt's cache hints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptCache
+{
+    /// The marked boundaries, in the order the backend lowers them.
+    pub markers: Vec<CacheMarker>,
+    /// Whether the backend may add structural shared prefixes.
+    pub structural: StructuralPrefixes,
+}
+
 /// What the prompt renders from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt
@@ -97,6 +187,8 @@ pub struct Prompt
     pub preserve_thinking: Switch,
     /// The reasoning effort asked for.
     pub effort: Effort,
+    /// Where the prompt may be published for reuse.
+    pub cache: PromptCache,
 }
 
 /// A sampling field the request set or left to the model's default for the

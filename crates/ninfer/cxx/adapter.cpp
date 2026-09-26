@@ -358,7 +358,9 @@ std::optional<::ninfer::ReasoningEffort> to_effort(EffortLevel value) noexcept {
 /// # Specification
 /// - requires: nothing.
 /// - ensures: every turn, part, carried reasoning, tool call, tool definition, template argument
-///   and choice is carried in order; the new turn is a fresh assistant turn.
+///   and choice is carried in order; the new turn is a fresh assistant turn; each cache mark
+///   becomes a shared-stable-prefix marker at its location with its evidence, and structural
+///   shared prefixes are allowed only as the prompt says.
 /// - provides: the input `Engine::prepare` renders.
 /// - fails: when allocation throws; it is not `noexcept`, and its one caller, `run_chat`, calls
 ///   it inside its catch-all.
@@ -392,6 +394,32 @@ std::optional<::ninfer::ReasoningEffort> to_effort(EffortLevel value) noexcept {
     input.options.chat_template_kwargs_json = std::string(prompt.template_arguments);
     input.options.add_vision_id             = false;
     for (const auto& tool : prompt.tools) { input.options.tool_jsons.emplace_back(tool); }
+    for (const auto& mark : prompt.cache_marks) {
+        ::ninfer::PromptCacheMarker marker;
+        marker.kind     = ::ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+        marker.evidence = static_cast<::ninfer::SharedCandidateEvidence>(mark.evidence);
+        switch (mark.location) {
+        case MarkLocation::LeadingInstruction:
+            marker.location = ::ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary;
+            marker.leading_instruction_bytes = mark.count;
+            break;
+        case MarkLocation::MessagePart:
+            marker.location = ::ninfer::PromptCacheMarkerLocation::MessagePartBoundary;
+            marker.after_message_count      = mark.count;
+            marker.after_message_part_count = mark.parts;
+            break;
+        case MarkLocation::Tool:
+            marker.location         = ::ninfer::PromptCacheMarkerLocation::ToolBoundary;
+            marker.after_tool_count = mark.count;
+            break;
+        default:
+            marker.location            = ::ninfer::PromptCacheMarkerLocation::MessageBoundary;
+            marker.after_message_count = mark.count;
+            break;
+        }
+        input.context_cache.markers.push_back(marker);
+    }
+    input.context_cache.allow_engine_automatic_shared_prefixes = prompt.structural_prefixes;
     return input;
 }
 
@@ -457,6 +485,11 @@ std::unique_ptr<Session> open_session(const EngineConfig& config, Outcome& outco
         options.kv_cache      = to_storage(config.kv_storage);
         options.prefill_chunk = config.prefill_chunk;
         options.max_concurrency = config.max_concurrency;
+        if (config.device_state_set) {
+            options.context_cache.device_state_slots = config.device_state_slots;
+        }
+        options.context_cache.host_state_slots       = config.host_state_slots;
+        options.context_cache.host_kv_capacity_bytes = config.host_kv_bytes;
         options.pending_timeout_ms        = config.pending_timeout_ms;
         options.use_cuda_graph            = config.cuda_graph == CudaGraph::On;
         options.speculative.backend       = ::ninfer::SpeculativeBackend::DFlash2;

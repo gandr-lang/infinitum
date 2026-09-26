@@ -144,6 +144,15 @@ pub mod ffi
         prefill_chunk: u32,
         /// Requests the Engine runs at once.
         max_concurrency: u32,
+        /// Whether `device_state_slots` is set; unset, the Engine keeps one
+        /// per lane.
+        device_state_set: bool,
+        /// Device checkpoint slots beyond the lanes.
+        device_state_slots: u32,
+        /// Host checkpoint slots.
+        host_state_slots: u32,
+        /// Host KV capacity in bytes.
+        host_kv_bytes: usize,
         /// How long a request may wait for admission, in milliseconds.
         pending_timeout_ms: u32,
         /// DFlash2's draft width `K`.
@@ -304,6 +313,35 @@ pub mod ffi
         Max,
     }
 
+    /// Where a prompt-cache marker sits.
+    #[derive(Debug)]
+    enum MarkLocation
+    {
+        /// After `count` bytes of the leading instruction's text.
+        LeadingInstruction,
+        /// After `parts` parts of the `count`-th message.
+        MessagePart,
+        /// After `count` messages.
+        Message,
+        /// After `count` tool definitions.
+        Tool,
+    }
+
+    /// One prompt-cache marker, a shared stable prefix.
+    #[derive(Debug)]
+    struct CacheMark
+    {
+        /// Where it sits.
+        location: MarkLocation,
+        /// Bytes, messages or tools, as `location` reads it.
+        count: u32,
+        /// Parts, for a message-part boundary; zero otherwise.
+        parts: u32,
+        /// ninfer's evidence bits: 1 explicit, 2 requested automatic, 4
+        /// default automatic.
+        evidence: u8,
+    }
+
     /// What the prompt renders from.
     #[derive(Debug)]
     struct ChatPrompt
@@ -320,6 +358,10 @@ pub mod ffi
         preserve_thinking: TemplateSwitch,
         /// The requested effort.
         effort: EffortLevel,
+        /// The prompt-cache markers, in order.
+        cache_marks: Vec<CacheMark>,
+        /// Whether the Engine may add structural shared prefixes.
+        structural_prefixes: bool,
     }
 
     /// Sampling overrides for one phase; each value applies only when its

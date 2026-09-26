@@ -771,6 +771,10 @@ pub fn warm_up(backend: &dyn ChatBackend) -> Result<(), infinitum_chat::ChatFail
             thinking: infinitum_chat::Switch::ModelDefault,
             preserve_thinking: infinitum_chat::Switch::ModelDefault,
             effort: infinitum_chat::Effort::Unrequested,
+            cache: infinitum_chat::PromptCache {
+                markers: Vec::new(),
+                structural: infinitum_chat::StructuralPrefixes::Allowed,
+            },
         },
         generation: infinitum_chat::Generation {
             output_tokens: TokenCount::from(4_u32),

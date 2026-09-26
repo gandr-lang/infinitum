@@ -8,6 +8,9 @@
 //! [`infinitum_round::Preview`] before the commit.
 
 use infinitum_chat::Admission;
+use infinitum_chat::Automatic;
+use infinitum_chat::CacheBoundary;
+use infinitum_chat::CacheMarker;
 use infinitum_chat::CancelToken;
 use infinitum_chat::Cancellation;
 use infinitum_chat::Channel;
@@ -22,6 +25,7 @@ use infinitum_chat::Effort;
 use infinitum_chat::FailureKind;
 use infinitum_chat::Finish;
 use infinitum_chat::GeneratedToolCall;
+use infinitum_chat::Marked;
 use infinitum_chat::ModelName;
 use infinitum_chat::PrefixReuse;
 use infinitum_chat::Role;
@@ -30,6 +34,7 @@ use infinitum_chat::Seed;
 use infinitum_chat::Setting;
 use infinitum_chat::SpecialTokens;
 use infinitum_chat::StopScope;
+use infinitum_chat::StructuralPrefixes;
 use infinitum_chat::Switch;
 use infinitum_chat::Tally;
 use infinitum_chat::ThinkingBudget;
@@ -256,6 +261,53 @@ fn lower_prompt(request: &ChatRequest) -> ffi::ChatPrompt
             | Effort::XHigh => ffi::EffortLevel::XHigh,
             | Effort::Max => ffi::EffortLevel::Max,
         },
+        cache_marks: prompt.cache.markers.iter().map(lower_mark).collect(),
+        structural_prefixes: prompt.cache.structural == StructuralPrefixes::Allowed,
+    };
+}
+
+/// Lower one cache marker to its location, counts and ninfer's evidence
+/// bits.
+///
+/// # Specification
+/// - requires: nothing.
+/// - ensures: the location and counts are `marker`'s boundary; the evidence
+///   sets bit 1 for an explicit mark, and bit 2 for a requested or bit 4 for a
+///   default automatic write.
+/// - provides: the adapter's `PromptCacheMarker` source.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 exhaustive over the four locations and the evidence
+///   combinations.
+/// - witness: `tests::cache_marks_lower_to_ninfers_bits`
+fn lower_mark(marker: &CacheMarker) -> ffi::CacheMark
+{
+    let (location, count, parts) = match marker.boundary {
+        | CacheBoundary::LeadingInstruction(bytes) => {
+            (ffi::MarkLocation::LeadingInstruction, bytes.0, 0)
+        },
+        | CacheBoundary::MessagePart { message, parts } => {
+            (ffi::MarkLocation::MessagePart, message.0, parts.0)
+        },
+        | CacheBoundary::Message(messages) => (ffi::MarkLocation::Message, messages.0, 0),
+        | CacheBoundary::Tool(tools) => (ffi::MarkLocation::Tool, tools.0, 0),
+    };
+    let explicit = match marker.marked {
+        | Marked::Unmarked => 0_u8,
+        | Marked::Explicit => 1,
+    };
+    let automatic = match marker.automatic {
+        | Automatic::Not => 0_u8,
+        | Automatic::Requested => 2,
+        | Automatic::Default => 4,
+    };
+    return ffi::CacheMark {
+        location,
+        count,
+        parts,
+        evidence: explicit | automatic,
     };
 }
 
@@ -516,13 +568,68 @@ impl ChatBackend for ChatEngine
 #[cfg(test)]
 mod tests
 {
+    use infinitum_chat::Automatic;
+    use infinitum_chat::CacheBoundary;
+    use infinitum_chat::CacheMarker;
+    use infinitum_chat::Count;
     use infinitum_chat::FailureKind;
+    use infinitum_chat::InstructionBytes;
+    use infinitum_chat::Marked;
     use infinitum_chat::Sampling;
     use infinitum_chat::Setting;
 
     use super::classify;
     use super::ffi;
+    use super::lower_mark;
     use super::lower_sampling;
+
+    /// Each location carries its counts, and the evidence bits are ninfer's
+    /// `SharedCandidateEvidence` values.
+    #[test]
+    fn cache_marks_lower_to_ninfers_bits()
+    {
+        let cases = [
+            (
+                CacheBoundary::LeadingInstruction(InstructionBytes(12)),
+                Marked::Explicit,
+                Automatic::Not,
+                (ffi::MarkLocation::LeadingInstruction, 12_u32, 0_u32, 1_u8),
+            ),
+            (
+                CacheBoundary::MessagePart {
+                    message: Count(3),
+                    parts: Count(2),
+                },
+                Marked::Explicit,
+                Automatic::Default,
+                (ffi::MarkLocation::MessagePart, 3, 2, 5),
+            ),
+            (
+                CacheBoundary::Message(Count(4)),
+                Marked::Unmarked,
+                Automatic::Default,
+                (ffi::MarkLocation::Message, 4, 0, 4),
+            ),
+            (
+                CacheBoundary::Tool(Count(1)),
+                Marked::Unmarked,
+                Automatic::Requested,
+                (ffi::MarkLocation::Tool, 1, 0, 2),
+            ),
+        ];
+        for (boundary, marked, automatic, expected) in cases {
+            let mark = lower_mark(&CacheMarker {
+                boundary,
+                marked,
+                automatic,
+            });
+            assert_eq!(
+                (mark.location, mark.count, mark.parts, mark.evidence),
+                expected,
+                "{boundary:?} {marked:?} {automatic:?}"
+            );
+        }
+    }
 
     #[test]
     fn set_and_unset_fields_keep_their_flags()

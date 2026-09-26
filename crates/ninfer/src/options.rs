@@ -1,6 +1,7 @@
 //! How an Engine is opened: the artifact, the device, the context ceiling,
 //! the KV cache's capacity and storage, the prefill chunk, the concurrency,
-//! the pending timeout, CUDA graph capture, and the chat template.
+//! the context cache's state and host KV capacities, the pending timeout,
+//! CUDA graph capture, and the chat template.
 
 /// The logical ceiling of one request in tokens, prompt and generation
 /// together. The Engine also sizes its KV cache from it, so a small ceiling
@@ -388,6 +389,123 @@ impl core::error::Error for ConcurrencyOutOfRange
 {
 }
 
+/// A count of recurrent-state checkpoint slots; zero is admitted.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateSlots(pub u32);
+
+impl StateSlots
+{
+    /// ninfer's default host state slots: eight.
+    pub const HOST_DEFAULT: Self = Self(8);
+}
+
+impl core::str::FromStr for StateSlots
+{
+    type Err = core::num::ParseIntError;
+
+    /// Parse a non-negative decimal slot count.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the count is the parsed value.
+    /// - provides: the command-line spelling of a slot count.
+    /// - fails: with the integer parser's error on a negative value, anything
+    ///   above `u32::MAX`, or a non-numeric string.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`core::num::ParseIntError`]: `text` is not a `u32`.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at the sign boundary — zero admitted, minus one
+    ///   refused.
+    /// - witness: `tests::context_cache_capacities_parse_ninfers_ranges`
+    #[inline]
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        return text.parse::<u32>().map(Self);
+    }
+}
+
+/// How many device checkpoint slots the context cache keeps beyond the
+/// active lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceStateSlots
+{
+    /// The Engine's default: one per lane.
+    PerLane,
+    /// This many.
+    Exactly(StateSlots),
+}
+
+/// The pinned host memory the context cache keeps for KV, in bytes.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostKvBytes(pub usize);
+
+impl HostKvBytes
+{
+    /// ninfer's default: 8192 MiB.
+    pub const DEFAULT: Self = Self(8192_usize << 20_u32);
+}
+
+impl core::str::FromStr for HostKvBytes
+{
+    type Err = HostKvOutOfRange;
+
+    /// Parse a non-negative decimal count of MiB whose bytes fit `usize`.
+    ///
+    /// # Specification
+    /// - requires: nothing.
+    /// - ensures: on success the capacity is the parsed MiB in bytes.
+    /// - provides: `--host-kv-mib`, with ninfer's range.
+    /// - fails: on a negative value, a non-numeric string, or a count whose
+    ///   bytes overflow `usize`.
+    /// - panics: none.
+    ///
+    /// # Errors
+    /// - [`HostKvOutOfRange`]: as stated.
+    ///
+    /// # Adequacy
+    /// - hypothesis: L3 at zero and at the overflow boundary.
+    /// - witness: `tests::context_cache_capacities_parse_ninfers_ranges`
+    #[inline]
+    fn from_str(text: &str) -> Result<Self, Self::Err>
+    {
+        return text
+            .parse::<usize>()
+            .ok()
+            .and_then(|mib| return mib.checked_mul(1 << 20_u32))
+            .map(Self)
+            .ok_or(HostKvOutOfRange);
+    }
+}
+
+/// A host KV capacity that is not a MiB count whose bytes fit `usize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostKvOutOfRange;
+
+impl core::fmt::Display for HostKvOutOfRange
+{
+    /// Render the failure, in ninfer's words.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    fn fmt(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result
+    {
+        return f.write_str("--host-kv-mib is out of range");
+    }
+}
+
+impl core::error::Error for HostKvOutOfRange
+{
+}
+
 /// How long a request may wait for admission, in milliseconds; past it the
 /// Engine refuses the request with a queue timeout.
 #[repr(transparent)]
@@ -584,6 +702,12 @@ pub struct EngineOptions
     prefill_chunk: PrefillChunk,
     /// The concurrency.
     concurrency: Concurrency,
+    /// Device checkpoint slots beyond the lanes.
+    device_state: DeviceStateSlots,
+    /// Host checkpoint slots.
+    host_state: StateSlots,
+    /// Host KV capacity.
+    host_kv: HostKvBytes,
     /// The pending timeout.
     pending_timeout: PendingTimeout,
     /// CUDA graph capture.
@@ -616,6 +740,9 @@ impl EngineOptions
             kv_storage: KvStorage::BFloat16,
             prefill_chunk: PrefillChunk::DEFAULT,
             concurrency: Concurrency::ONE,
+            device_state: DeviceStateSlots::PerLane,
+            host_state: StateSlots::HOST_DEFAULT,
+            host_kv: HostKvBytes::DEFAULT,
             pending_timeout: PendingTimeout::DEFAULT,
             cuda_graph,
             chat_template: ChatTemplate::Artifact,
@@ -780,6 +907,62 @@ impl EngineOptions
         return self.concurrency;
     }
 
+    /// The same options with the context cache keeping `device` device
+    /// checkpoint slots beyond the lanes, `host` host slots, and `host_kv`
+    /// bytes of host KV.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub fn with_context_cache(
+        self,
+        device: DeviceStateSlots,
+        host: StateSlots,
+        host_kv: HostKvBytes,
+    ) -> Self
+    {
+        return Self {
+            device_state: device,
+            host_state: host,
+            host_kv,
+            ..self
+        };
+    }
+
+    /// Device checkpoint slots beyond the lanes; one per lane unless set.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn device_state(&self) -> DeviceStateSlots
+    {
+        return self.device_state;
+    }
+
+    /// Host checkpoint slots; ninfer's eight unless set.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn host_state(&self) -> StateSlots
+    {
+        return self.host_state;
+    }
+
+    /// Host KV capacity; ninfer's 8192 MiB unless set.
+    ///
+    /// # Specification
+    /// trivial.
+    #[inline]
+    #[must_use]
+    pub const fn host_kv(&self) -> HostKvBytes
+    {
+        return self.host_kv;
+    }
+
     /// The same options with `template` rendering chat prompts.
     ///
     /// # Specification
@@ -865,12 +1048,15 @@ mod tests
     use super::CudaGraph;
     use super::DeviceOrdinal;
     use super::EngineOptions;
+    use super::HostKvBytes;
+    use super::HostKvOutOfRange;
     use super::KvBelowContext;
     use super::KvCapacity;
     use super::KvStorage;
     use super::MalformedKvCapacity;
     use super::PendingTimeout;
     use super::PrefillChunk;
+    use super::StateSlots;
     use super::UnknownCudaGraph;
     use super::UnknownKvStorage;
 
@@ -1016,6 +1202,32 @@ mod tests
             Concurrency::from_str("9"),
             Err(ConcurrencyOutOfRange),
             "past ninfer's range"
+        );
+    }
+
+    /// Slot counts admit zero and refuse minus one; host KV admits zero, reads
+    /// MiB, and refuses a count whose bytes overflow.
+    #[test]
+    fn context_cache_capacities_parse_ninfers_ranges()
+    {
+        assert_eq!(StateSlots::from_str("0"), Ok(StateSlots(0)), "no slots");
+        assert!(StateSlots::from_str("-1").is_err(), "no negative count");
+        assert_eq!(HostKvBytes::from_str("0"), Ok(HostKvBytes(0)), "no host KV");
+        assert_eq!(
+            HostKvBytes::from_str("36864"),
+            Ok(HostKvBytes(36864 << 20_u32)),
+            "MiB are read as bytes"
+        );
+        let largest = (usize::MAX >> 20_u32).to_string();
+        assert!(
+            HostKvBytes::from_str(&largest).is_ok(),
+            "the largest fitting count"
+        );
+        let overflowing = ((usize::MAX >> 20_u32) + 1).to_string();
+        assert_eq!(
+            HostKvBytes::from_str(&overflowing),
+            Err(HostKvOutOfRange),
+            "one MiB more overflows"
         );
     }
 

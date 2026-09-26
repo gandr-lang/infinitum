@@ -14,13 +14,16 @@ use infinitum_ninfer::ContextLimit;
 use infinitum_ninfer::CudaGraph;
 use infinitum_ninfer::DFlash2Plan;
 use infinitum_ninfer::DeviceOrdinal;
+use infinitum_ninfer::DeviceStateSlots;
 use infinitum_ninfer::EngineOptions;
+use infinitum_ninfer::HostKvBytes;
 use infinitum_ninfer::KvBelowContext;
 use infinitum_ninfer::KvCapacity;
 use infinitum_ninfer::KvStorage;
 use infinitum_ninfer::Ninfer;
 use infinitum_ninfer::PendingTimeout;
 use infinitum_ninfer::PrefillChunk;
+use infinitum_ninfer::StateSlots;
 use infinitum_round::Backend as _;
 use infinitum_round::BuildFailure;
 use infinitum_round::DraftWidth;
@@ -61,6 +64,16 @@ pub struct Server
     /// up to `--pending-timeout-ms`.
     #[arg(long, value_name = "LANES", default_value = "1")]
     max_concurrency: Concurrency,
+    /// Device recurrent-state checkpoint slots kept beyond the active lanes
+    /// for prefix reuse; absent, one per lane.
+    #[arg(long, value_name = "SLOTS")]
+    device_state_slots: Option<StateSlots>,
+    /// Host recurrent-state checkpoint slots for prefix reuse.
+    #[arg(long, value_name = "SLOTS", default_value = "8")]
+    host_state_slots: StateSlots,
+    /// Pinned host memory for reusable KV, in MiB.
+    #[arg(long, value_name = "MIB", default_value = "8192")]
+    host_kv_mib: HostKvBytes,
     /// The output limit of a request that names none; the Engine also clamps
     /// it to the context left after the prompt.
     #[arg(long, value_name = "TOKENS", default_value = "8192")]
@@ -284,8 +297,8 @@ fn plan(server: &Server) -> Result<DFlash2Plan, ServeFailure>
 /// - requires: nothing.
 /// - ensures: on success the options carry the artifact, device, context, KV
 ///   capacity (the context ceiling when absent), KV storage, prefill chunk,
-///   concurrency, pending timeout, CUDA graph choice and chat template the
-///   flags name.
+///   concurrency, context-cache capacities, pending timeout, CUDA graph choice
+///   and chat template the flags name.
 /// - provides: every Engine option `serve` sets, checked before an Engine
 ///   opens.
 /// - fails: when `--kv-capacity` is a token count below `--max-context`.
@@ -314,7 +327,14 @@ fn engine_options(server: &Server) -> Result<EngineOptions, ServeFailure>
     .with_pending_timeout(server.pending_timeout_ms)
     .with_kv_storage(server.kv_dtype)
     .with_prefill_chunk(server.prefill_chunk)
-    .with_concurrency(server.max_concurrency);
+    .with_concurrency(server.max_concurrency)
+    .with_context_cache(
+        server
+            .device_state_slots
+            .map_or(DeviceStateSlots::PerLane, DeviceStateSlots::Exactly),
+        server.host_state_slots,
+        server.host_kv_mib,
+    );
     return match server.kv_capacity {
         | Some(capacity) => options
             .with_kv_capacity(capacity)
