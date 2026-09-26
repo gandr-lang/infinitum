@@ -60,6 +60,19 @@ pub struct Record
     pub message: String,
 }
 
+/// What the log counts of a request's body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyCounts
+{
+    /// Messages in the conversation.
+    pub messages: Count,
+    /// Tools declared, whether or not the tool choice offers them, as ninfer
+    /// counts them.
+    pub tools: Count,
+    /// Image and video parts.
+    pub media: Count,
+}
+
 /// What the log knows of a request before it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestShape
@@ -68,10 +81,8 @@ pub struct RequestShape
     pub id: RequestId,
     /// Streamed or aggregate.
     pub delivery: Delivery,
-    /// Messages in the conversation.
-    pub messages: Count,
-    /// Tools offered.
-    pub tools: Count,
+    /// Its body's counts.
+    pub counts: BodyCounts,
     /// The output limit.
     pub max_output: TokenCount,
     /// The reasoning effort asked for.
@@ -270,8 +281,8 @@ pub fn started(
         "req#{} started | {PROTOCOL} {} | {} {} | max output {}",
         shape.id.0,
         delivery_name(shape.delivery).0,
-        shape.messages,
-        if shape.messages == Count(1) {
+        shape.counts.messages,
+        if shape.counts.messages == Count(1) {
             "message"
         }
         else {
@@ -295,8 +306,8 @@ pub fn started(
         },
         | Thinking::Closed => out.push_str("off"),
     }
-    if shape.tools != Count(0) {
-        put(&mut out, format_args!(" | tools {}", shape.tools));
+    if shape.counts.tools != Count(0) {
+        put(&mut out, format_args!(" | tools {}", shape.counts.tools));
     }
     if shape.preserve_thinking == Switch::On {
         out.push_str(" | preserve thinking");
@@ -504,13 +515,10 @@ pub fn done(
 ///
 /// # Specification
 /// - requires: `shape` is the request's.
-/// - ensures: before submission, `req#<id> <rejected|cancelled|failed> during
-///   prepare | openai-chat <stream|non-stream>` with the failure fields, ` |
-///   messages <n>` and ` | tools <n>` when tools were offered, as ninfer's
-///   `render_request_rejected`, rejected for client input or overload and
-///   cancelled for a disconnect; after it, `req#<id> <failed | cancelled>
-///   during <generation | transport> | openai-chat` with the failure fields, as
-///   ninfer's `render_request_failure`. The severity is the class's.
+/// - ensures: before submission, [`rejected`]'s line; after it, `req#<id>
+///   <failed | cancelled> during <generation | transport> | openai-chat` with
+///   the failure fields, as ninfer's `render_request_failure`. The severity is
+///   the class's.
 /// - provides: the failure record.
 /// - fails: never.
 /// - panics: none.
@@ -526,44 +534,69 @@ pub fn failed(
     error: &ApiError,
 ) -> Record
 {
+    if phase == Phase::Prepare {
+        return rejected(shape.id, shape.delivery, shape.counts, error);
+    }
     let class = Class::of(error);
-    let mut out = String::new();
-    match phase {
-        | Phase::Prepare => {
-            let verb = match class {
-                | Class::ClientDisconnected => "cancelled",
-                | Class::ClientInput | Class::Overload => "rejected",
-                | Class::Timeout | Class::Unavailable | Class::Upstream | Class::Internal => {
-                    "failed"
-                },
-            };
-            put(
-                &mut out,
-                format_args!(
-                    "req#{} {verb} during prepare | {PROTOCOL} {}",
-                    shape.id.0,
-                    delivery_name(shape.delivery).0
-                ),
-            );
-            failure_fields(&mut out, error);
-            put(&mut out, format_args!(" | messages {}", shape.messages));
-            if shape.tools != Count(0) {
-                put(&mut out, format_args!(" | tools {}", shape.tools));
-            }
-        },
-        | Phase::Generation => {
-            let (verb, during) = if class == Class::ClientDisconnected {
-                ("cancelled", "transport")
-            }
-            else {
-                ("failed", "generation")
-            };
-            put(
-                &mut out,
-                format_args!("req#{} {verb} during {during} | {PROTOCOL}", shape.id.0),
-            );
-            failure_fields(&mut out, error);
-        },
+    let (verb, during) = if class == Class::ClientDisconnected {
+        ("cancelled", "transport")
+    }
+    else {
+        ("failed", "generation")
+    };
+    let mut out = format!("req#{} {verb} during {during} | {PROTOCOL}", shape.id.0);
+    failure_fields(&mut out, error);
+    return Record {
+        severity: class.severity(),
+        message: out,
+    };
+}
+
+/// The line for a numbered request refused before submission.
+///
+/// # Specification
+/// - requires: `counts` are the body's.
+/// - ensures: `req#<id> <rejected|cancelled|failed> during prepare |
+///   openai-chat <stream|non-stream>` with the failure fields, ` | messages
+///   <n>`, ` | media <n>` when media parts were sent and ` | tools <n>` when
+///   tools were declared, as ninfer's `render_request_rejected`: rejected for
+///   client input or overload, cancelled for a disconnect. The severity is the
+///   class's.
+/// - provides: the record of a request refused while it was prepared, whether
+///   by the body's own checks or by the Engine.
+/// - fails: never.
+/// - panics: none.
+///
+/// # Adequacy
+/// - hypothesis: L3 on each verb and the optional counts.
+/// - witness: `tests::failure_lines_follow_ninfer`
+#[inline]
+#[must_use]
+pub fn rejected(
+    id: RequestId,
+    delivery: Delivery,
+    counts: BodyCounts,
+    error: &ApiError,
+) -> Record
+{
+    let class = Class::of(error);
+    let verb = match class {
+        | Class::ClientDisconnected => "cancelled",
+        | Class::ClientInput | Class::Overload => "rejected",
+        | Class::Timeout | Class::Unavailable | Class::Upstream | Class::Internal => "failed",
+    };
+    let mut out = format!(
+        "req#{} {verb} during prepare | {PROTOCOL} {}",
+        id.0,
+        delivery_name(delivery).0
+    );
+    failure_fields(&mut out, error);
+    put(&mut out, format_args!(" | messages {}", counts.messages));
+    if counts.media != Count(0) {
+        put(&mut out, format_args!(" | media {}", counts.media));
+    }
+    if counts.tools != Count(0) {
+        put(&mut out, format_args!(" | tools {}", counts.tools));
     }
     return Record {
         severity: class.severity(),
@@ -573,28 +606,27 @@ pub fn failed(
 
 impl RequestShape
 {
-    /// The shape of `request`, numbered `id`.
+    /// The shape of `request`, numbered `id`, whose body counted `counts`.
     ///
     /// # Specification
     /// - requires: nothing.
-    /// - ensures: the delivery, message and offered-tool counts, output limit,
-    ///   effort and preserve-thinking choice are `request`'s.
+    /// - ensures: the counts are `counts`; the delivery, output limit, effort
+    ///   and preserve-thinking choice are `request`'s.
     /// - provides: every line's request facts.
     /// - fails: never.
     /// - panics: none.
     #[must_use]
     #[inline]
-    pub fn of(
+    pub const fn of(
         id: RequestId,
+        counts: BodyCounts,
         request: &ChatRequest,
     ) -> Self
     {
-        let count = |length: usize| return Count(u64::try_from(length).unwrap_or(u64::MAX));
         return Self {
             id,
             delivery: request.delivery,
-            messages: count(request.prompt.messages.len()),
-            tools: count(request.prompt.tools.len()),
+            counts,
             max_output: request.generation.output_tokens,
             effort: request.prompt.effort,
             preserve_thinking: request.prompt.preserve_thinking,
@@ -1146,6 +1178,7 @@ mod tests
     use infinitum_round::TokenCount;
     use infinitum_round::TokenId;
 
+    use super::BodyCounts;
     use super::Count;
     use super::Phase;
     use super::RequestId;
@@ -1153,6 +1186,7 @@ mod tests
     use super::Severity;
     use super::done;
     use super::failed;
+    use super::rejected;
     use super::started;
     use crate::error::ApiError;
 
@@ -1160,8 +1194,11 @@ mod tests
     const SHAPE: RequestShape = RequestShape {
         id: RequestId(7),
         delivery: Delivery::Streaming,
-        messages: Count(1),
-        tools: Count(0),
+        counts: BodyCounts {
+            messages: Count(1),
+            tools: Count(0),
+            media: Count(0),
+        },
         max_output: TokenCount::ZERO,
         effort: Effort::Unrequested,
         preserve_thinking: Switch::ModelDefault,
@@ -1185,8 +1222,11 @@ mod tests
             "thinking on under a budget"
         );
         let tooled = RequestShape {
-            messages: Count(3),
-            tools: Count(2),
+            counts: BodyCounts {
+                messages: Count(3),
+                tools: Count(2),
+                media: Count(0),
+            },
             effort: Effort::Low,
             preserve_thinking: Switch::On,
             delivery: Delivery::Aggregate,
@@ -1512,5 +1552,25 @@ mod tests
             "a fault after submission names its class"
         );
         assert_eq!(line.severity, Severity::Error, "a fault is an error");
+        let vision = ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: String::from("vision_disabled"),
+            ..internal
+        };
+        assert_eq!(
+            rejected(
+                RequestId(15),
+                Delivery::Aggregate,
+                BodyCounts {
+                    messages: Count(1),
+                    tools: Count(2),
+                    media: Count(1),
+                },
+                &vision
+            )
+            .message,
+            "req#15 rejected during prepare | openai-chat non-stream | HTTP 400 | vision disabled | messages 1 | media 1 | tools 2",
+            "media before tools, each when sent"
+        );
     }
 }

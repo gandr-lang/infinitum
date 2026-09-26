@@ -41,7 +41,7 @@ use crate::oplog::RequestId;
 use crate::oplog::RequestShape;
 use crate::parse::Defaults;
 use crate::parse::FreshSeed;
-use crate::parse::ParsedChat;
+use crate::parse::Usage;
 use crate::parse::chat_request;
 use crate::render::ChunkStream;
 use crate::render::Identity;
@@ -614,7 +614,7 @@ impl tokio_stream::Stream for EventBody
 /// Run an aggregate request.
 ///
 /// # Specification
-/// - requires: nothing.
+/// - requires: `shape` is `request`'s.
 /// - ensures: 200 with the completion, or the failure's error response; if the
 ///   handler is dropped first, the request is cancelled; the request's start
 ///   and end are logged.
@@ -625,12 +625,12 @@ async fn aggregate(
     shared: Arc<Shared>,
     identity: Identity,
     request: ChatRequest,
+    shape: RequestShape,
 ) -> Response
 {
     let cancel = CancelToken::new();
     let _guard = CancelOnDrop(cancel.clone());
     let backend = Arc::clone(&shared.backend);
-    let shape = RequestShape::of(shared.next_request(), &request);
     let ran = tokio::task::spawn_blocking(move || {
         let mut aggregate = Aggregate;
         let mut events = Logged::new(&mut aggregate, shape);
@@ -651,7 +651,7 @@ async fn aggregate(
 /// Run a streamed request.
 ///
 /// # Specification
-/// - requires: nothing.
+/// - requires: `shape` is `request`'s.
 /// - ensures: a failure before submission is an error response; after it, a 200
 ///   event stream of the opening chunk, the deltas, and either the closing
 ///   chunks or an error event; dropping the handler or the body cancels the
@@ -661,8 +661,10 @@ async fn aggregate(
 /// - panics: none.
 async fn streamed(
     shared: Arc<Shared>,
-    parsed: ParsedChat,
+    request: ChatRequest,
+    include_usage: Usage,
     identity: Identity,
+    shape: RequestShape,
 ) -> Response
 {
     let cancel = CancelToken::new();
@@ -670,9 +672,7 @@ async fn streamed(
     let (decision, decided) = tokio::sync::oneshot::channel();
     let (body, events) = tokio::sync::mpsc::unbounded_channel();
     let backend = Arc::clone(&shared.backend);
-    let request = parsed.request;
-    let encoder = ChunkStream::new(identity, parsed.include_usage);
-    let shape = RequestShape::of(shared.next_request(), &request);
+    let encoder = ChunkStream::new(identity, include_usage);
     let _running = tokio::task::spawn_blocking(move || {
         let mut sink = Streamed {
             encoder,
@@ -736,9 +736,12 @@ async fn streamed(
 /// # Specification
 /// - requires: nothing.
 /// - ensures: a body over the configured cap is 413 `request_too_large` with
-///   ninfer's message; a body that is not JSON is 400; a refused body is its
-///   translation error; another model id is 404 `model_not_found`; otherwise
-///   the request runs aggregate or streamed as it asks.
+///   ninfer's message; a body that is not JSON is 400; a body refused while
+///   parsing is its translation error; another model id is 404
+///   `model_not_found`; none of these is numbered or logged, as ninfer's are
+///   not. Otherwise the request is numbered: one refused while preparing is its
+///   error, logged as rejected during prepare; the rest run aggregate or
+///   streamed as they ask.
 /// - provides: chat completions.
 /// - fails: never; failures are responses.
 /// - panics: none.
@@ -784,10 +787,26 @@ async fn chat(
     if parsed.model != shared.config.model {
         return error_response(&model_not_found(&parsed.model));
     }
-    let identity = Identity::new(parsed.model.0.clone());
+    let id = shared.next_request();
+    let request = match parsed.prepared {
+        | Ok(request) => request,
+        | Err(error) => {
+            crate::oplog::emit(&crate::oplog::rejected(
+                id,
+                parsed.delivery,
+                parsed.counts,
+                &error,
+            ));
+            return error_response(&error);
+        },
+    };
+    let shape = RequestShape::of(id, parsed.counts, &request);
+    let identity = Identity::new(parsed.model.0);
     return match parsed.delivery {
-        | Delivery::Aggregate => aggregate(shared, identity, parsed.request).await,
-        | Delivery::Streaming => streamed(shared, parsed, identity).await,
+        | Delivery::Aggregate => aggregate(shared, identity, request, shape).await,
+        | Delivery::Streaming => {
+            streamed(shared, request, parsed.include_usage, identity, shape).await
+        },
     };
 }
 
