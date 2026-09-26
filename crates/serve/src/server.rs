@@ -895,9 +895,8 @@ pub fn warm_up(
 /// - ensures: the ready line is logged, then the four routes answer as their
 ///   handlers specify, behind the gate, with request bodies capped at the
 ///   configured size, while throughput is logged at the configured interval; on
-///   SIGINT or SIGTERM (Ctrl-C off Unix) the server stops accepting, finishes
-///   its open connections, stops the throughput reporter, logs `server stopped`
-///   and returns, as ninfer's server stops on those signals.
+///   SIGINT or SIGTERM (Ctrl-C off Unix) the server stops as [`serve_with`]
+///   stops, as ninfer's server stops on those signals.
 /// - provides: `infinitum serve`'s server.
 /// - fails: when the listener has no address, the signal handlers cannot be
 ///   installed, or accepting fails.
@@ -908,9 +907,10 @@ pub fn warm_up(
 ///
 /// # Adequacy
 /// - hypothesis: L2 — `tests::routes_answer_through_the_gate` drives the router
-///   with a scripted backend and the `termination` integration test stops a
-///   running server in its own process; the served comparison against
-///   `ninfer-serve` checks the engine path end to end.
+///   with a scripted backend, the `termination` integration test stops a
+///   running server in its own process, and [`serve_with`]'s witness holds the
+///   reporter across shutdown; the served comparison against `ninfer-serve`
+///   checks the engine path end to end.
 /// - witness: `tests::routes_answer_through_the_gate`
 /// - witness: `termination::tests::a_termination_signal_stops_the_server`
 #[inline]
@@ -921,27 +921,68 @@ pub async fn serve(
 ) -> Result<(), std::io::Error>
 {
     let stop = stop_requested()?;
-    crate::oplog::emit(&crate::oplog::listening(
+    return serve_with(listener, backend, config, stop, crate::oplog::emit).await;
+}
+
+/// Serve until `stop` completes, writing the server's lines through `log`.
+///
+/// # Specification
+/// - requires: called within a multi-threaded tokio runtime with timers.
+/// - ensures: as [`serve`], with `stop` as the stop request; once it completes,
+///   the server stops accepting and finishes its open connections, then the
+///   throughput reporter is stopped and joined, so a sample it had begun writes
+///   its line first, and `server stopped` is the last line.
+/// - provides: [`serve`]'s body, with the stop and the log injectable.
+/// - fails: when the listener has no address or accepting fails.
+/// - panics: none.
+///
+/// # Errors
+/// - [`std::io::Error`]: the server could not start or failed.
+///
+/// # Adequacy
+/// - hypothesis: L3 on a stop arriving while the reporter is inside a sample.
+/// - witness: `tests::the_stop_line_follows_an_inflight_throughput_sample`
+async fn serve_with<Stop, Log>(
+    listener: tokio::net::TcpListener,
+    backend: Arc<dyn ChatBackend>,
+    config: ServeConfig,
+    stop: Stop,
+    log: Log,
+) -> Result<(), std::io::Error>
+where
+    Stop: Future<Output = ()> + Send + 'static,
+    Log: Fn(&crate::oplog::Record) + Clone + Send + 'static,
+{
+    log(&crate::oplog::listening(
         listener.local_addr()?,
         &config.model,
         &config.access,
     ));
     let reporter = match config.stats {
-        | StatsInterval::Every(period) => Some(tokio::spawn(report_throughput(
-            Arc::clone(&backend),
-            period,
-            crate::oplog::emit,
-        ))),
+        | StatsInterval::Every(period) => {
+            let (halt, halted) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(report_throughput(
+                Arc::clone(&backend),
+                period,
+                halted,
+                log.clone(),
+            ));
+            Some((halt, task))
+        },
         | StatsInterval::Off => None,
     };
     let served = axum::serve(listener, router(backend, config))
         .with_graceful_shutdown(stop)
         .await;
-    if let Some(ref reporter) = reporter {
-        reporter.abort();
+    if let Some((halt, task)) = reporter {
+        // The reporter takes no sample after the stop, and joining it waits
+        // out a sample under way, whose line is then written before the stop
+        // line.
+        let _finished = halt.send(());
+        let _joined = task.await;
     }
     served?;
-    crate::oplog::emit(&crate::oplog::Record {
+    log(&crate::oplog::Record {
         severity: crate::oplog::Severity::Info,
         message: String::from("server stopped"),
     });
@@ -1012,8 +1053,19 @@ fn stop_requested() -> Result<impl Future<Output = ()>, std::io::Error>
     });
 }
 
+/// What the reporter does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextStep
+{
+    /// The server asked it to stop.
+    Stop,
+    /// A period elapsed: sample.
+    Sample,
+}
+
 /// Write the backend's throughput every `period` through `write`, as
-/// ninfer's stats reporter logs it.
+/// ninfer's stats reporter logs it, until `stop` fires or its sender is
+/// dropped.
 ///
 /// # Specification
 /// - requires: called within a tokio runtime with timers.
@@ -1021,18 +1073,22 @@ fn stop_requested() -> Result<impl Future<Output = ()>, std::io::Error>
 ///   [`crate::oplog::throughput`] line for the interval since the last sample
 ///   is written when it saw activity; a late tick waits a full period from when
 ///   it ran, as ninfer resets a missed deadline; a failed sample writes one
-///   warning and ends the reporter.
+///   warning and ends the reporter; a stop ends it before the next sample, even
+///   when that sample is already due, so a sample under way when the stop
+///   arrives is the last.
 /// - provides: the periodic throughput log.
 /// - fails: never; a failed sample ends the reporter, not the server.
 /// - panics: none.
 ///
 /// # Adequacy
 /// - hypothesis: L3 under a paused clock on a quiet interval, an active one and
-///   a failed sample.
+///   a failed sample; and a stop arriving mid-sample with the next tick due.
 /// - witness: `tests::throughput_reports_active_intervals_until_a_sample_fails`
+/// - witness: `tests::the_stop_line_follows_an_inflight_throughput_sample`
 async fn report_throughput<Write>(
     backend: Arc<dyn ChatBackend>,
     period: core::time::Duration,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
     mut write: Write,
 ) where
     Write: FnMut(&crate::oplog::Record),
@@ -1054,7 +1110,21 @@ async fn report_throughput<Write>(
     );
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticks.tick().await;
+        // The stop is polled first, so a due tick never outruns it; the
+        // receiver is never polled again once it is ready.
+        let next = core::future::poll_fn(|cx| {
+            if core::pin::Pin::new(&mut stop).poll(cx).is_ready() {
+                return core::task::Poll::Ready(NextStep::Stop);
+            }
+            if ticks.poll_tick(cx).is_ready() {
+                return core::task::Poll::Ready(NextStep::Sample);
+            }
+            return core::task::Poll::Pending;
+        })
+        .await;
+        if next == NextStep::Stop {
+            return;
+        }
         let current = match backend.counters() {
             | Ok(counters) => counters,
             | Err(failure) => return write(&stopped(&failure)),
@@ -1596,9 +1666,11 @@ mod tests
             ]),
         };
         let mut lines = Vec::new();
+        let (_running, stop) = tokio::sync::oneshot::channel();
         super::report_throughput(
             Arc::new(backend),
             core::time::Duration::from_secs(5),
+            stop,
             |record: &crate::oplog::Record| lines.push(record.clone()),
         )
         .await;
@@ -1617,6 +1689,140 @@ mod tests
                 },
             ],
             "one active line, then the warning"
+        );
+    }
+
+    /// A backend whose second counter sample reports activity only once the
+    /// test releases it, telling the test when that sample has begun.
+    struct Held
+    {
+        /// Its name.
+        model: ModelName,
+        /// Samples taken so far.
+        taken: core::sync::atomic::AtomicUsize,
+        /// Told when the held sample begins.
+        entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        /// Releases the held sample.
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ChatBackend for Held
+    {
+        /// Its name.
+        ///
+        /// # Specification
+        /// trivial.
+        fn model_name(&self) -> &ModelName
+        {
+            return &self.model;
+        }
+
+        /// Idle first; then hold inside the sample until released, and report
+        /// decoded tokens.
+        ///
+        /// # Specification
+        /// trivial.
+        fn counters(&self) -> Result<infinitum_chat::RuntimeCounters, ChatFailure>
+        {
+            let idle = infinitum_chat::RuntimeCounters::default();
+            if self
+                .taken
+                .fetch_add(1, core::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return Ok(idle);
+            }
+            if let Ok(entered) = self.entered.lock() {
+                let _told = entered.send(());
+            }
+            if let Ok(release) = self.release.lock() {
+                let _released = release.recv();
+            }
+            return Ok(infinitum_chat::RuntimeCounters {
+                decode_tokens: Tally(50),
+                ..idle
+            });
+        }
+
+        /// Refuse; no request is sent.
+        ///
+        /// # Specification
+        /// trivial.
+        fn run(
+            &self,
+            _request: &ChatRequest,
+            _events: &mut dyn ChatEvents,
+            _cancel: &CancelToken,
+        ) -> Result<ChatOutcome, ChatFailure>
+        {
+            return Err(ChatFailure {
+                kind: FailureKind::Internal,
+                message: String::from("not a chat backend"),
+            });
+        }
+    }
+
+    /// A stop that arrives while the reporter is inside a sample waits for
+    /// that sample's line, so `server stopped` is the last line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stop_line_follows_an_inflight_throughput_sample()
+    {
+        let (entered, entered_seen) = std::sync::mpsc::channel();
+        let (released, release) = std::sync::mpsc::channel();
+        let backend = Held {
+            model: ModelName(String::from("m")),
+            taken: core::sync::atomic::AtomicUsize::new(0),
+            entered: std::sync::Mutex::new(entered),
+            release: std::sync::Mutex::new(release),
+        };
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let written = Arc::clone(&lines);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = tokio::spawn(super::serve_with(
+            listener,
+            Arc::new(backend),
+            ServeConfig {
+                model: ModelId(String::from("m")),
+                access: Access::Open,
+                max_model_len: TokenCount::from(64_u32),
+                defaults: Defaults {
+                    output_tokens: TokenCount::from(16_u32),
+                    thinking_budget: infinitum_chat::ThinkingBudget::Unlimited,
+                },
+                max_request: RequestBytes(core::num::NonZeroUsize::new(1024).unwrap()),
+                stats: super::StatsInterval::Every(core::time::Duration::from_millis(10)),
+            },
+            async move {
+                let _asked = stopped.await;
+            },
+            move |record: &crate::oplog::Record| {
+                written.lock().unwrap().push(record.message.clone());
+            },
+        ));
+        tokio::task::spawn_blocking(move || return entered_seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        stop.send(()).unwrap();
+        tokio::time::sleep(core::time::Duration::from_millis(200)).await;
+        released.send(()).unwrap();
+        tokio::time::timeout(core::time::Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let lines = lines.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|line| return line.starts_with("throughput |")),
+            "the held sample wrote its line: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("server stopped"),
+            "nothing follows the stop line: {lines:?}"
         );
     }
 }
